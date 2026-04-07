@@ -382,8 +382,11 @@ python -m lax.scripts.submit_ray_job --no-wait \
 - **Destination**: `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/fidelity_multilingual_v1.lance`
 - **Limit**: 3,000,000 rows
 - **ETA**: ~8.5 hours processing + ~15 min overhead (at ~98 rows/sec)
-- **Status**: FAILED → resubmitted as `raysubmit_GByqaBLBHyRF3jEX`
-- **Failure**: Dataset has 54,905 fragments — randomized read with limit=3M was too slow. Resubmitted with `--no-randomized`.
+- **Status**: FAILED → resubmitted twice
+- **Failure 1** (`raysubmit_cMEA1TCAqTUT8Nqq`): Dataset has 54,905 fragments — randomized read with limit=3M was too slow. Resubmitted with `--no-randomized`.
+- **Failure 2** (`raysubmit_GByqaBLBHyRF3jEX`): Ray head pod restarted, losing job state (404 not found). Cluster showed Ready but job was gone.
+- **Failure 3** (`raysubmit_76JnAh13s4psimmn`): Ray head pod restarted again (404). Cluster was unstable.
+- **Final resubmit** (`raysubmit_A5fEikcCdtFXSNjZ`): Fresh cluster `dongguo-dongguo-fidelity-4f6501`. Submitted 2026-03-19 00:38 PDT. Running overnight.
 
 **Launch script**:
 
@@ -401,7 +404,7 @@ python -m lax.scripts.submit_ray_job --no-wait \
 **Check status**:
 
 ```bash
-ray job status raysubmit_GByqaBLBHyRF3jEX \
+ray job status raysubmit_A5fEikcCdtFXSNjZ \
   --address "$RAY_ADDRESS" \
   --headers "{\"Authorization\": \"Bearer $RAY_PROXY_TOKEN\"}"
 ```
@@ -411,6 +414,7 @@ ray job status raysubmit_GByqaBLBHyRF3jEX \
 ```bash
 cd projects/kuma && source .venv/bin/activate
 flytecli ray-cluster --name dongguo-fidelity --delete --yes
+# New cluster CR: dongguo-dongguo-fidelity-4f6501
 ```
 
 ---
@@ -472,6 +476,80 @@ flytecli ray-cluster --name dongguo-fidelity --delete --yes
 - Table already has `avgu__filtering_audiobox` (audiobox CE/CU/PC/PQ scores from Inkyu's AVGU pipeline). Fidelity pipeline adds bandwidth_hz + sound_events.
 - 38,110 rows — small table, should complete in ~10 min after cold start
 - Estimated time depends on row count: ~30K rows/hr on 1 node with 8 H100 GPUs (after cold start)
+
+---
+
+## 2026-03-19
+
+### Fidelity Output Tables — Inventory
+
+All tables produced by the fidelity pipeline. Schema: `bandwidth_hz`, `aes_ce`, `aes_cu`, `aes_pc`, `aes_pq`, `sound_events`, `original_row_id`.
+
+#### Production tables
+
+| Table | Rows | Fragments | Source | Status |
+|-------|------|-----------|--------|--------|
+| `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/fidelity_eng_v1.lance` | 311,000 | 41 | `whisperx__eng_v1.lance` (English podcast ASR) | Complete |
+| `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/fidelity_multilingual_v1.lance` | 461,937 | 57 | `whisperx__multilingual_v1.lance` (Multilingual podcast ASR) | In progress (500K job running) |
+
+#### Test / experiment tables
+
+| Table | Rows | Fragments | Notes |
+|-------|------|-----------|-------|
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/audio_pipeline/internal_audio_v1_fidelity_metadata.lance` | 5,000 | 1 | Full fidelity on internal_audio_v1 |
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/audio_pipeline/internal_audio_v1_fidelity_metadata_test.lance` | 3,000 | 1 | Test run |
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/audio_pipeline/internal_audio_v1_fidelity_test.lance` | 3,000 | 2 | Test run |
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/audio_pipeline/internal_audio_v1_1_fidelity_test.lance` | 3,000 | 1 | Test run (variant 1) |
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/audio_pipeline/internal_audio_v1_2_fidelity_test.lance` | 3,000 | 1 | Test run (variant 2) |
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/audio_pipeline/podcast_10m_segments_fidelity_metadata.lance` | 30,000 | 6 | Local experiment (eager/streaming/processpool comparison) |
+
+#### Local parquet copies
+
+| File | Rows | Source |
+|------|------|--------|
+| `/Users/dongguo/Projects/adhoc/fidelity_eng_v1.parquet` | 311,000 | Snapshot of eng production table |
+| `/Users/dongguo/Projects/adhoc/fidelity_multilingual_v1.parquet` | 461,937 | Partial snapshot of multilingual table |
+| `/Users/dongguo/Projects/adhoc/internal_audio_v1_fidelity_metadata.parquet` | 5,000 | From earlier experiment |
+
+---
+
+## Full Lance Table Inventory (as of 2026-03-19)
+
+### Active tables
+
+| Table | Rows | Fragments | Status | Notes |
+|-------|------|-----------|--------|-------|
+| `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/fidelity_eng_v1.lance` | 311,000 | 41 | Active | Production, English podcast |
+| `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/fidelity_multilingual_v1.lance` | 461,937 | 57 | In progress | Target: 3M, multilingual podcast |
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/audio_pipeline/internal_audio_v1_fidelity_metadata.lance` | 5,000 | 1 | Active | internal_audio_v1 sample |
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/audio_pipeline/podcast_10m_segments_fidelity_metadata.lance` | 30,000 | 6 | Active | Local experiment results |
+
+### Test tables (can delete)
+
+| Table | Rows | Status | Notes |
+|-------|------|--------|-------|
+| `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/bandwidth_only_test.lance` | 100 | Test | Bandwidth-only pipeline test, can delete |
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/audio_pipeline/internal_audio_v1_fidelity_metadata_test.lance` | 3,000 | Test | AccessDenied on delete |
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/audio_pipeline/internal_audio_v1_fidelity_test.lance` | 3,000 | Test | AccessDenied on delete |
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/audio_pipeline/internal_audio_v1_1_fidelity_test.lance` | 3,000 | Test | AccessDenied on delete |
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/audio_pipeline/internal_audio_v1_2_fidelity_test.lance` | 3,000 | Test | AccessDenied on delete |
+
+### Deleted tables
+
+| Table | Notes |
+|-------|-------|
+| `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/fidelity_eng_v1_demo.lance` | Broken (NULL columns), deleted 2026-03-19 |
+| `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/fidelity_eng_v1_1_demo.lance` | Case study demo, deleted 2026-03-19 |
+
+### Local parquet copies
+
+| File | Rows | Source |
+|------|------|--------|
+| `internal_audio_v1_5K.parquet` | 5,000 | `internal_audio_v1_fidelity_metadata.lance` |
+| `internal_audio_v1_fidelity_metadata.parquet` | 25,000 | Older run (not matching S3 table) |
+| `podcast_segment_30K.parquet` | 30,000 | `podcast_10m_segments_fidelity_metadata.lance` |
+| `fidelity_eng_v1.parquet` | 311,000 | `fidelity_eng_v1.lance` |
+| `fidelity_multilingual_v1.parquet` | 461,937 | `fidelity_multilingual_v1.lance` (partial) |
 
 ---
 
