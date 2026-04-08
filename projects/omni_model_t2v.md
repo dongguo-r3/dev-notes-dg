@@ -1,7 +1,19 @@
 # Uni-1 (Omni) T2V Training Project
 
-**Branch:** `dongguo/omni-t2v` on `lumalabs/lumaverse`  
-**Date:** 2026-04-06  
+> **What this note is for:** Extending the uni-1 (omni) model from T2I to T2V, reusing Ray3's data infrastructure and 3D VAE. Tracks key design decisions, code changes, data pipeline, and training configs.
+>
+> | Area | Status | Latest |
+> |---|---|---|
+> | Code changes (9 modified + 7 new files) | ✅ Complete | Branch `dongguo/omni-t2v` |
+> | Pipeline validation (synthetic) | ✅ Passing | `t2v_smoke_test.py --synthetic` |
+> | 0.6B GPU smoke test | 🔲 Not yet run | Config: `exp_t2v_360p_smoke_0_6b` |
+> | 32B real training | 🔲 Blocked | Needs T2I stage 5 checkpoint path |
+> | Sigma shift tuning | 🔲 TODO | Current override=7.0 is estimate |
+
+---
+
+**Branch:** `dongguo/omni-t2v` on `lumalabs/lumaverse`
+**Date:** 2026-04-06
 **Status:** Code complete, ready for GPU smoke test
 
 ---

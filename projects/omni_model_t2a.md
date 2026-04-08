@@ -1,7 +1,21 @@
 # Omni T2A Project Notes
 
-**Started:** 2026-04-07  
-**Author:** Dong Guo  
+> **What this note is for:** Architecture, implementation, and training details for adding a text-to-audio (T2A) generation stream to the uni-1 Omni MoT model. Covers design decisions, data pipeline, attention masking mechanics, and sequence parallelism.
+>
+> | Area | Status | Latest |
+> |---|---|---|
+> | Model architecture | ✅ Implemented | `AudioPreprocess` + `Qwen3TextAudioPackedPreprocess` in `model.py` |
+> | Training configs | ✅ Implemented | MMAudio (16kHz) + Hunyuan DAC VAE (48kHz) variants |
+> | Smoke test (1 GPU) | ✅ Passing | 11 bugs found and fixed |
+> | Full training (8 GPU) | 🔲 Not yet run | Config ready: `exp_0_6b_mmaudio` |
+> | Multi-node Flyte launch | 🔲 TODO | — |
+> | Inference processor | 🔲 TODO | — |
+> | Evaluation (FAD/CLAP) | 🔲 TODO | vs reference run `tage001-internal-audio-v2-k3600` |
+
+---
+
+**Started:** 2026-04-07
+**Author:** Dong Guo
 **Branch:** development branch (not merged to main)
 
 ---

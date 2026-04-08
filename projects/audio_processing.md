@@ -1,5 +1,15 @@
 # Audio Processing Notes
 
+> **What this note is for:** How audio data is processed in lumaverse — covering I/O libraries, resampling backends, bandwidth measurement, upsampling artifacts, and source separation. A technical reference for understanding how audio flows through the stack.
+>
+> - **Audio I/O inventory:** `audiotools`, `hplv`, `koba` v1/v2, `taro`, `ursa` — each library's decoder, resampler, and output format
+> - **Resampling:** 6 backends compared (julius, torchaudio, librosa/soxr, PyAV, FFmpeg) — quality, speed, and use sites
+> - **Bandwidth measurement:** spectral rolloff at 95% energy via `librosa` in the fidelity pipeline (only implementation in repo)
+> - **Upsampling artifacts:** spectral gap above original Nyquist is the dominant concern; filter-level artifacts are minor; 4 mitigation options for TTA training
+> - **Demucs source separation:** htdemucs used in opt-in ASR/diarize pipeline for noisy audio
+
+---
+
 Technical notes on audio data I/O, signal processing, resampling, and bandwidth measurement across the lumaverse repo. Compiled from internal investigation (2026-03-18).
 
 ---

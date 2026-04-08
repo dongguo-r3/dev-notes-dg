@@ -1,5 +1,16 @@
 # Audio Data Notes
 
+> **What this note is for:** Catalog of audio datasets available in lumaverse — their S3 locations, schema (audio/transcript column names), row counts, sample rates, and intended use. Reference this when setting up a new training pipeline or checking what data is available.
+>
+> | Category | Datasets | Notes |
+> |---|---|---|
+> | T2A training | Emilia, Internal Audio V1/V1-EN, Podcast Golden, Internal Audio V2 EN | Various languages and sample rates |
+> | T2AV training | AI Humans (fixed 5s), AI Humans (variable 3-20s), AVGU Mosaic v3 | Paired audio-video data |
+> | Audio resources | Zapsplat (SFX), LibriSpeech, Common Voice 17 | Secondary/reference datasets |
+> | Raw S3 audio | 7M + 10M podcast MP3s, Zapsplat, LibriSpeech FLAC | Unprocessed source files |
+
+---
+
 Survey of audio datasets in lumaverse (main branch, 2026-03-19).
 
 ## T2A Training Datasets

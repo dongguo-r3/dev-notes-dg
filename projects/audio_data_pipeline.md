@@ -1,5 +1,14 @@
 # Audio Data Processing Logs
 
+> **What this note is for:** Run logs for specific audio data pipeline jobs — job IDs, cluster assignments, throughput, failures, and outcomes. Each entry is a discrete pipeline execution against a dataset.
+>
+> | Date | Pipeline | Dataset | Outcome |
+> |---|---|---|---|
+> | 2026-03-18 | Fidelity (bandwidth + AES + SED) | `whisperx__eng_v1` (podcast_10m, 10K rows) | ✅ 10K rows in 36 min, 8×H100 kiwi-flyte |
+> | 2026-04-08 | Fidelity | `internal_audio_v1` (~92M rows, 8 partitions) | 🟡 Running — p0 on kiwi (Sydney), p1-p7 on omniva (US, ~30% throughput) |
+
+---
+
 ## 2026-03-18 Summary
 
 - Refactored `fidelity_pipeline.py` to align with `podcast_asr_pipeline.py` patterns (dynamic concurrency via `_detect_cluster_gpus()`, `num_gpus=1` per actor, removed dead fractional GPU code)
