@@ -23,6 +23,13 @@ Technical notes on audio data I/O, signal processing, resampling, and bandwidth 
   - [Filter-level artifacts by backend](#filter-level-artifacts-by-backend)
   - [The real problem: spectral gap (major)](#the-real-problem-spectral-gap-major)
   - [Recommendations for podcast data in TTA training](#recommendations-for-podcast-data-in-tta-training)
+- [Demucs Source Separation in the ASR/Diarize Pipeline](#demucs-source-separation-in-the-asrdiarize-pipeline)
+  - [What is Demucs?](#what-is-demucs)
+  - [How It's Used](#how-its-used)
+  - [Pipeline Flow](#pipeline-flow)
+  - [When to Use](#when-to-use)
+  - [Diarization Trade-off](#diarization-trade-off)
+  - [GPU Memory for Large-Scale Processing](#gpu-memory-for-large-scale-processing)
 
 ---
 
@@ -372,3 +379,172 @@ Given that podcast audio is typically 16-24kHz source sample rate being upsample
 - **Option D: Bandwidth extension model.** Apply a neural bandwidth extension model (e.g., AudioSR) before training to synthesize plausible high-frequency content. Adds compute and potential artifacts of its own.
 
 **Bottom line**: The choice of resampler barely matters — `soxr_hq` is marginally cleanest. The real risk is the empty spectrum above the original Nyquist, which affects model training regardless of backend. Use the `bandwidth_hz` metric to handle this at the data curation level.
+
+---
+
+## Demucs Source Separation in the ASR/Diarize Pipeline
+
+Notes from investigation of `projects/lax/lax/projects/av_data_processing/audio/asr_diarize/` (2026-04-08).
+
+### What is Demucs?
+
+Demucs (htdemucs variant) is Meta's **Hybrid Transformer Demucs** — a U-Net style encoder-decoder for music source separation. It is **not autoregressive**; it processes audio in a single forward pass. Architecture:
+
+- Two parallel U-Net branches: one on raw waveforms (temporal), one on spectrograms (spectral)
+- Cross-attention transformer layers bridging the two branches in the bottleneck
+- Outputs all stems (vocals, drums, bass, other) simultaneously
+
+Model size: ~80–85M parameters, ~330MB in float32 weights.
+
+### How It's Used
+
+Demucs is invoked as a **Python library** (not CLI) in `models/vocal_separator.py`:
+
+```python
+import demucs.pretrained
+from demucs.apply import apply_model
+
+model = demucs.pretrained.get_model("htdemucs")
+sources = apply_model(model, waveform, overlap=0.25, shifts=1)
+```
+
+Configuration:
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `model_name` | `htdemucs` | Hybrid Transformer variant |
+| `device` | `cuda` | GPU inference |
+| `overlap` | `0.25` | Overlap ratio between chunks |
+| `shifts` | `1` | No extra random shifts (fastest) |
+| `segment_length` | `None` | Uses model default chunking |
+
+### Pipeline Flow
+
+3-stage pipeline defined in `podcast_asr_pipeline.py` → `run_podcast_pipeline_gpu_with_separation()`:
+
+```
+Stage 1: Mp3AudioLoader
+  └─ Download audio from S3
+
+Stage 2: VocalSeparator (Demucs)
+  └─ Load audio at model native SR (44.1kHz)
+  └─ Run htdemucs, extract "vocals" stem only
+  └─ Convert to mono WAV → output as vocal_bytes
+  └─ Pass original audio through as audio_bytes
+  └─ On failure: graceful fallback to original audio
+
+Stage 3: PodcastV2Processor
+  └─ Run WhisperX ASR on clean vocals (vocal_bytes)
+  └─ Run diarization on original or vocals (configurable)
+  └─ Segment into 3–15s TTS training clips
+```
+
+### When to Use
+
+This is an **opt-in pipeline** for noisy audio (field recordings, live events). Clean podcast audio uses `run_podcast_pipeline_gpu()` without Demucs.
+
+### Diarization Trade-off
+
+A `diarize_on_original` flag in `processor.py` controls the diarization source:
+
+- **`True` (on original)**: Better speaker embeddings, but background music may confuse diarization
+- **`False` (on vocals)**: Cleaner audio, but Demucs may alter speaker embeddings
+
+### GPU Memory for Large-Scale Processing
+
+For large-scale short audio datasets (~10s clips) on H100 (80GB HBM3):
+
+- Model weights: ~330MB per copy (~1.6GB for 5 copies)
+- Activations for 10s audio: a few hundred MB per inference
+- **5+ actors per GPU is very comfortable** — well under 10GB total, small fraction of 80GB
+- Bottleneck is likely compute throughput, not memory
+- Consider sharing a single model across actors for maximum memory efficiency
+
+---
+
+## internal_audio_v1 Fidelity Pipeline Run (2026-04-08)
+
+### Goal
+
+Compute audio fidelity metadata (bandwidth, AES, SED, EAT) for the `internal_audio_v1` source table and save to the fidelity output table.
+
+| Stage | Dataset | S3 URI |
+|-------|---------|--------|
+| **Source** | `internal_audio_v1_captioned_original_sr_v3_merged_v4` | `s3://ai-lumalabs-datasets-ap-se-2/inkyu/lax/audio_segmentation/internal_audio_v1_captioned_original_sr_v3_merged_v4.lance` |
+| **Fidelity output** | `internal_audio_v1_fidelity_p{N}of8` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/audio_pipeline/internal_audio_v1_fidelity_p{N}of8.lance` |
+
+- **Source rows**: 92,221,138 (~92M)
+- **Partitioning**: 8 partitions (p0-p7), ~11.5M rows each
+- **Audio column**: `audio_bytes_ori`
+- **Branch**: `dongguo/audio-metadata` at commit `2644403` ("[lax] Override __call__ in FidelityProcessor to skip per-row gc/cache clear")
+
+### Throughput Bottleneck Fix
+
+`BaseProcessor.__call__` (in `lax/core/processors/base_processor.py`) runs `gc.collect()` + `torch.cuda.empty_cache()` after every row (added in PRs #6914 and #6991). For lightweight GPU processors like FidelityProcessor (~14ms/row ONNX inference), this overhead causes ~290x throughput regression (380 rows/s → 1.3 rows/s).
+
+The fix: `FidelityProcessor` overrides `__call__` to skip these calls. This was originally implemented in commit `2644403` (Apr 3), accidentally removed in the next commit `d19d2cc` during documentation cleanup, then restored on Apr 8 by resetting the branch back to `2644403`.
+
+### First Attempt — Failed (Apr 8)
+
+Launched 8 partitions on kiwi clusters (`dongguo-metadata-tmp-*` and `dongguo-vibevoice-tmp-s*`). Issues:
+- Code was from branch tip `35ec70f` which lacked the `__call__` override → throughput bottleneck
+- 4 of 8 clusters had 0 available workers → jobs failed with `ValueError: min_size must be >= 1`
+- 1 cluster (p6 on `dongguo-vibevoice-tmp-s3-543e8a`) had no GPU worker → stuck pending
+- All jobs stopped, all `dongguo-vibevoice-tmp-s*` clusters deleted
+
+### Second Attempt — Running (Apr 8)
+
+After resetting `dongguo/audio-metadata` to `2644403` (with `__call__` override), relaunched all 8 partitions:
+
+| Partition | Cluster | Location | Job ID |
+|-----------|---------|----------|--------|
+| p0 | `dongguo-metadata-tmp-5cfb4d` | kiwi-flyte | `raysubmit_ttt5TKXNA8LVxATY` |
+| p1 | `dongguo-vibevoice-omniva-s6-fecd96` | omniva-flyte | `raysubmit_TLhgEd9jNV1bfRhJ` |
+| p2 | `dongguo-vibevoice-omniva-s0-b76d15` | omniva-flyte | `raysubmit_Z8pnJu8s97JQRDgS` |
+| p3 | `dongguo-vibevoice-omniva-s1-502299` | omniva-flyte | `raysubmit_DekX5cajTSmNXh73` |
+| p4 | `dongguo-vibevoice-omniva-s2-dfb184` | omniva-flyte | `raysubmit_ejwt3F4ThBtsDqKZ` |
+| p5 | `dongguo-vibevoice-omniva-s3-9ec3db` | omniva-flyte | `raysubmit_XYJUHz5EsxqDt4Wf` |
+| p6 | `dongguo-vibevoice-omniva-s4-eef6d4` | omniva-flyte | `raysubmit_eNBZ8YcJ6wVcDMiX` |
+| p7 | `dongguo-vibevoice-omniva-s5-2e0b2e` | omniva-flyte | `raysubmit_szGErCCsmC3mkEcv` |
+
+Each cluster: 1 node × 8 H100 GPUs. Expected throughput ~380 rows/s per node.
+
+### Checking Job Status
+
+```bash
+# Setup proxy (kiwi for p0, omniva for p1-p7)
+source scripts/setup-ray-proxy.sh kiwi-flyte dongguo-metadata-tmp-5cfb4d
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-vibevoice-omniva-s6-fecd96
+
+# Check status
+ray job status <job_id>
+ray job logs <job_id>
+```
+
+### Kiwi vs Omniva Throughput Analysis
+
+p0 (kiwi) processes at ~3.4 fragments/min vs p2-p6 (omniva) at ~1.1 fragments/min — omniva runs at **~30% of kiwi's throughput** for this pipeline.
+
+**Root cause: cross-region S3 read latency.** The source Lance table is in `s3://ai-lumalabs-datasets-ap-se-2` (Sydney). Kiwi is also in Sydney → low-latency reads. Omniva is in US → every S3 read has cross-region latency.
+
+Evidence from job logs (object store ramp-up in first 40s):
+- **p0 (kiwi):** 0 → 25 → 42 → 60 → 74 → 90 → 106 → 119 GiB — reader floods the object store
+- **p2 (omniva):** stuck at 3.4 GiB — reader starves the GPU actors
+
+The pipeline config is identical (same image, `num_gpus=0.25`, `min_concurrency=32`). GPUs are 8/8 allocated on both, but omniva actors idle waiting for data.
+
+**Cluster selection rule of thumb:**
+
+| Per-row latency | Bottleneck | Use omniva? |
+|----------------|------------|-------------|
+| <50ms (fidelity, bandwidth) | Reader / S3 I/O | No — use kiwi (same region as S3) |
+| >500ms (VLM captioning, LLM) | GPU compute | Yes — cross-region latency negligible |
+
+For compute-intensive tasks (e.g. multimodal LLM dense captioning at seconds/row), the GPU processing time dominates and cross-region S3 latency becomes negligible. The reader easily keeps up because actors consume data slowly. Omniva's available GPU capacity makes it a good fit for these workloads.
+
+### Post-Processing (TODO)
+
+After all 8 partitions complete:
+1. Merge 8 partition tables into final `internal_audio_v1_fidelity.lance`
+2. Run fidelity filter to produce filter scores table
+3. Update README dataset table with final URIs
