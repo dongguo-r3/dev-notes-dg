@@ -1656,6 +1656,47 @@ class LanceReader:
 
 ---
 
+## Option B PoC Run (2026-04-09)
+
+### Run: omni_t2a_0_6b_pretrained_v2
+
+W&B: https://wandb.ai/luma-ai/omni-t2a/runs/u27stj53
+Branch: `dongguo/omni-t2a-v2`
+
+**Architecture**: AudioBatchingDatasetV2 (V2 LanceReader, memory leak fix) → OmniT2ABridgeDataset (tokenize + pack) → OmniT2ATrainer
+
+| Setting | Value |
+|---------|-------|
+| Model | 0.6B, Qwen3-0.6B pretrained text (frozen), random audio stream |
+| Data loader | Option B: `AudioBatchingDatasetV2` + bridge layer |
+| Dataset | emilia + internal-audio-v1 (via `t2a_dataset()`) |
+| Duration buckets | [5.04, 7.54, 10.04, 12.54, 15.04] s |
+| Batch sizes per bucket | [32, 24, 16, 12, 8] |
+| max_num_tokens | 8000 |
+| FSDP | GenericTransformerHSDP2, intra_node_shard=8 |
+| Loss | Pure diffusion MSE |
+
+### Early Training Progress
+
+| Step | diffusion_loss | step_time | data_time | Notes |
+|------|---------------|-----------|-----------|-------|
+| 1 | 1.898 | 80.1s | 41.6s | Cold start (torch.compile + queue fill) |
+| 13 | 1.811 | 16.0s | 3.3s | Warming up |
+| 39 | 1.869 | 13.0s | 1.6s | Stabilizing |
+
+### Key Improvements over V1 Data Loader Run
+
+| Metric | V1 (previous, OOM'd at ~300 steps) | Option B (current) |
+|--------|-------------------------------------|-------------------|
+| Memory leak | Yes (Lance S3, ~350 MB/hr) | **No** (V2 LanceReader resets handles) |
+| Duration bucketing | No (variable per pack) | **Yes** (uniform duration per batch) |
+| data_time (stabilized) | ~2.0s | ~1.6s |
+| step_time (stabilized) | ~7.3s | ~13.0s (still warming up, expected to decrease) |
+
+Note: step_time is higher because this is earlier in torch.compile warmup. The previous V1 run's 7.3s was measured at step 200+. Option B step_time should converge to similar values.
+
+---
+
 ## Medium-Term Roadmap
 
 Three task types with different loss structures:
