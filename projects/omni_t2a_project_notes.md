@@ -197,6 +197,14 @@ Key hyperparameters adopted:
 | 9 | `flex_attn_mask required` | `use_flex_attention=False` in model config | Set `use_flex_attention=True` |
 | 10 | Shape mismatch `x=59, gate=16165` | `OmniElementAudio` read `shape[0]` (channel=1) not `shape[-1]` (frames) | `num_frames = audio_tensor.shape[-1]` |
 | 11 | Shape mismatch after fix 10 | `compression_factor=960` (DAC) but MMAudio uses `hop_length=512` | `compression_factor=512` for MMAudio |
+| 12 | `RecursiveHSDP assert count > 0` (8-GPU) | `RecursiveHSDP` looks for `TransformerBlock` type, but omni uses `BagelMultiStreamBlock` | Use `GenericTransformerHSDP2(block_module_name=["blocks"])` (finds by name not type) |
+| 13 | `LanceDataset.Config() got unexpected kwarg 'to_tensor_fn'` | `AllModalityDatasetWithMultithreading` passes `to_tensor_fn=None` but `LanceDataset.Config` doesn't accept it | Remove `to_tensor_fn=None` from `all_modality_dataset_with_multithreading.py:142` |
+| 14 | `LanceDataset row_filter` treats SQL string as file path | `row_filter` expects Lance dataset path for row-index filtering, not SQL | Use processor-level `RowFieldFilter` instead of Lance SQL filter |
+| 15 | `LanceDataset filter` raises `NotImplementedError` | `filter` intentionally blocked ("not well supported yet") | Same as #14 — processor-level filtering |
+| 16 | SIGKILL at step 136 (8-GPU, max_num_tokens=8000) | Lance S3 Rust-side memory leak — fragment metadata cache grows unbounded with random access | Known issue: PR #7121 fixes koba V2 `LanceReader` but NOT V1 `AllModalityDatasetWithMultithreading`. Added periodic `gc.collect()` + `pa.release_unused()` every 50 batches as workaround |
+| 17 | V2 LanceReader: `generator already executing` | Shared `_sampler_iter` (Python generator) accessed from multiple ThreadPoolExecutor threads | Python generators are NOT thread-safe. Fixed by using thread-local sampler iterators |
+| 18 | V2 LanceReader: Lance Rust panic `take.rs:273 unwrap on None` | `ds.take(indices)` panics when called from multiple threads even with thread-local `LanceReader` instances | Lance library bug. `ds.take()` (used by V2 reader) is not thread-safe. Reverted to V1 `AllModalityDatasetWithMultithreading` which uses batch iteration (different code path, no `take()`) |
+| 19 | V2 LanceReader: OOM at `max_num_tokens=16000` and `26000` | GPU memory spike during FlexAttention block mask compilation + FSDP all-gather of frozen text weights | Reduced `max_num_tokens` to 8000 (~33GB/GPU, well within 80GB H100). Future: try `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` |
 
 ---
 
@@ -491,9 +499,1192 @@ Both are precomputed once per forward pass in the preprocessor and reused in eve
 
 ---
 
+## Data Loader Upgrade (2026-04-08)
+
+### Problem
+
+Original data loader used single-threaded `BaseDataset`. Smoke test showed `data_time=0.44s` vs `step_time=0.38s` — data was the bottleneck.
+
+### Fix
+
+Replaced `BaseDataset` with `AllModalityDatasetWithMultithreading` (same infrastructure used by production omni T2I). Added `AudioToX` processor for audio normalization (peak norm, RMS norm, clamping).
+
+### Results
+
+| Mode | data_time | step_time | Status |
+|------|-----------|-----------|--------|
+| Single-threaded (before) | 0.44s | 0.38s | Data bottleneck |
+| Multi-threaded (after) | **0.11s** | 4.4s | **Compute bottleneck** (correct) |
+
+### Test Results
+
+- Sync mode, 1 rank: **PASS** (5/5 batches valid)
+- Multi-GPU simulation, 4 ranks: **PASS** (all ranks produce different valid batches)
+- Async mode, 1 rank: **PASS** (10/10 batches, 37% throughput improvement)
+- 8-GPU FSDP, full 0.6B model: **PASS** (300+ steps, loss decreasing)
+
+---
+
+## Loss Fix: Pure Diffusion (2026-04-08)
+
+Removed CE (cross-entropy) loss from `BagelT2ALoss`. For T2A, the text transcript is **input context only** — not a prediction target. The model generates audio conditioned on text, not text itself.
+
+Before: `loss = diffusion_loss x 1.0 + ce_loss x 0.25`
+After: `loss = diffusion_loss x 1.0`
+
+CE loss will be re-added for future CoT (chain-of-thought) generation, where the model first generates an extended text plan, then audio.
+
+---
+
+## Token Packing and Attention (2026-04-08)
+
+### Packing Strategy
+
+Multiple T2A samples are concatenated into a single packed sequence:
+
+```
+Pack: [text_1][audio_1][text_2][audio_2][text_3][audio_3]...
+      <-------------- up to max_num_tokens (4000) ---------->
+```
+
+No padding within individual audio clips. Each clip is encoded to its natural length. Padding only at the end of the pack (for FlexAttention block alignment).
+
+### Why max_num_tokens=4000?
+
+With FlexAttention + per-sample block mask, attention compute is **O(N * K^2)**, not O(S^2):
+- S = N * K (N samples, K tokens each). Block mask skips cross-sample attention.
+- Doubling N (more samples) is **linear**. The quadratic cost is per-sample K only.
+
+| max_num_tokens | N samples (K=200) | Compute | Scaling |
+|---------------|-------------------|---------|---------|
+| 4,000 | ~20 | N*K^2 = 800K | 1x |
+| 16,000 | ~80 | 3.2M | 4x (linear) |
+| 32,000 | ~160 | 6.4M | 8x (linear) |
+
+The real bottleneck is **per-sample K** (individual clip duration). A 60s clip has K=1875 → K^2=3.5M, larger than 20 short samples combined. Sequence parallelism (Ulysses) is needed for long individual clips, not for more short clips.
+
+### Per-Sample Isolation in Packed Attention
+
+FlexAttention block mask ensures each sample only attends within itself:
+
+```
+                text_1  audio_1  text_2  audio_2  text_3  audio_3
+
+text_1         [causal    .        .       .        .       .   ]
+audio_1        [ full   noise      .       .        .       .   ]
+text_2         [  .       .     causal     .        .       .   ]
+audio_2        [  .       .      full    noise      .       .   ]
+text_3         [  .       .        .       .     causal     .   ]
+audio_3        [  .       .        .       .      full    noise ]
+
+. = blocked (cross-sample)
+```
+
+Within each sample: text=causal (sees only text), audio=noise (sees everything).
+
+---
+
+## Dataset: internal-audio-v2 (2026-04-08)
+
+The correct S3 path (was registered incorrectly):
+
+```
+s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance
+```
+
+(Note: bucket is `ai-lumalabs-datasets-ap-se-2-lance`, not `ai-lumalabs-datasets-ap-se-2`)
+
+| Property | Value |
+|----------|-------|
+| Total rows | 221.8M |
+| English rows (`language = 'en'`) | 166.4M (75%) |
+| Language column | `language` (string) |
+| Transcript column | `whisperx_asr_content` (format: `[SPEAKER_XX]"text"`) |
+| Audio column | `audio_bytes` (`list<binary>` — needs unwrapping) |
+| Quality filter | `round1_pass_all_filter = 1` |
+
+English-only filter: `` `round1_pass_all_filter` = 1 AND `language` = 'en' ``
+
+### Lance Filtering Gotcha
+
+`LanceDataset` in koba does **NOT** support SQL-level filtering:
+- `LanceDataset.Config(filter=...)` raises `NotImplementedError("Filter is not well supported yet")`
+- `LanceDataset.Config(row_filter=...)` expects a **Lance dataset path** (for row-index filtering), not a SQL string
+
+Workaround: filter at the **processor level** using a `RowFieldFilter` processor inserted at the start of the pipeline chain (before `AudioDecoder`, so no wasted decode compute on dropped rows):
+
+```python
+class RowFieldFilter:
+    class Config(EasyConfig):
+        required_fields: dict[str, object] | None = None  # e.g., {"language": "en", "round1_pass_all_filter": 1}
+
+    def forward(self, sample: dict) -> dict | None:
+        for field, value in self.config.required_fields.items():
+            if sample.get(field) != value:
+                return None  # drop this row
+        return sample
+```
+
+The SQL filter string (e.g., `` `round1_pass_all_filter` = 1 AND `language` = 'en' ``) is parsed into `required_fields` dict and applied per-row. Placed first in the processor chain so filtered rows never reach the expensive `AudioDecoder`.
+
+### audio_bytes Column Type
+
+The `audio_bytes` column in `whisperx__multilingual_v1_compacted.lance` is `list<binary>` (a list containing one binary element), not plain `binary`. The `AudioDecoder` was patched to handle this:
+
+```python
+if isinstance(audio_bytes, list):
+    audio_bytes = audio_bytes[0]  # unwrap list<binary>
+```
+
+---
+
+## PoC Overnight Training Config (2026-04-09)
+
+Config: `kuma.projects.omni.bagel.configs.t2a.exp_0_6b_mmaudio_pretrained`
+
+```bash
+torchrun --standalone --nproc_per_node 8 main.py \
+    --config kuma.projects.omni.bagel.configs.t2a.exp_0_6b_mmaudio_pretrained \
+    --name omni_t2a_0_6b_pretrained
+```
+
+| Setting | Value |
+|---------|-------|
+| **Model** | 0.6B (hidden=1024, 28 layers, 16 heads) |
+| **Text stream** | Qwen3-0.6B pretrained (`osc://sam/qwen_3_single_weights_0_6B.pt`), **frozen** |
+| **Audio stream** | Random init (xavier + zeros), **trainable** |
+| **Audio VAE** | MMAudio 16k (20-dim latents, scaling_factor=1/2.3563) |
+| **Dataset** | internal-audio-v2-english (~124M rows, quality + English filter) |
+| **Transcript key** | `whisperx_asr_content` (format: `[SPEAKER_XX]"text"`) |
+| **Audio key** | `audio_bytes` (`list<binary>`, unwrapped by AudioDecoder) |
+| **max_num_tokens** | 4000 |
+| **FSDP** | GenericTransformerHSDP2, intra_node=8 |
+| **LR** | 1e-4, AdamW, warmup 5K steps |
+| **Weight decay** | 0.01 |
+| **Loss** | Pure diffusion MSE (no CE loss) |
+| **Noise** | SampleLogSNRGeneric(shift=-1.6), truncated normal, sigma_shift=3.0 |
+| **CFG dropout** | 0.1 (10% samples drop text for CFG training) |
+| **Checkpoints** | Every 1000 steps |
+| **W&B** | Enabled, project `omni-t2a` |
+
+### Why 0.6B (not 2B)?
+
+Originally planned 2B, but HuggingFace `Qwen/Qwen3-2B` now points to Qwen3.5 (MoE architecture, model type `qwen3_5`), not the dense Qwen3. Our installed transformers version doesn't support `qwen3_5`, and the omni team hasn't pre-converted a dense Qwen3-2B checkpoint. The 0.6B checkpoint exists and is confirmed working.
+
+For the PoC, 0.6B is sufficient: ~300M trainable params (audio stream only), estimates 5K-10K steps overnight on 8xH100.
+
+### Diffusion Parameters (matching reference run)
+
+All diffusion-specific parameters match the reference run `tage001-internal-audio-v2-k3600`:
+
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| `logsnr_shift` | -1.6 | Controls noise level distribution. Lower = more emphasis on higher noise |
+| `noise_scale` | 1.0 | Std dev of truncated normal logSNR sampling |
+| `sigma_shift` | 3.0 | Rescales sigma: `sigma_shifted = (shift*sigma) / (1 + (shift-1)*sigma)` |
+| `latent_scaling` | 1/2.3563 | Normalizes MMAudio latents to ~unit variance |
+| `corruption` | Rectified flow | `zt = (1-sigma)*z0 + sigma*eps` |
+| `target` | Rectified flow velocity | Model predicts velocity (not noise or clean) |
+| `cfg_dropout` | 0.1 | 10% samples train unconditional for CFG inference |
+
+Goal: verify the model can produce "speech-like sound" after overnight training.
+
+---
+
+## Weight Initialization Strategy (2026-04-08)
+
+### Text Stream (Stream 0) — Qwen3-0.6B Pretrained, Frozen
+
+Load Qwen3-0.6B pretrained weights via `InitializerFromSingleCheckpoint(checkpoint_path="osc://sam/qwen_3_single_weights_0_6B.pt", strict=False)`. Text stream parameters match exactly:
+
+- Text embedding (151,936 -> 1024)
+- 28 transformer blocks (stream 0: self-attn Q/K/V/O, FFN, RMSNorm)
+- Text out_proj / lm_head (1024 -> 151,936 vocab logits)
+
+Frozen via `freeze_text_stream()` — optimizer's `parameters_fn` excludes all text params:
+- `streams_pre.0.*` / `streams_post.0.*` (text stream blocks)
+- `preprocess.text_processor.embedding.weight`
+- `postprocess.out_projs.0.*`
+
+No gradient, no optimizer state for these parameters. The text stream serves as a **fixed text encoder** (analogous to UMT5-XXL in the Ray3 reference run, but using packed joint attention instead of cross-attention).
+
+### Audio Stream (Stream 1) — Random Init from Scratch
+
+No existing checkpoint has matching architecture (0.6B Qwen3 block config trained on audio diffusion). All audio-specific weights initialized from scratch.
+
+Init schemes (baked into the omni model configs):
+
+| Component | Init | Why |
+|-----------|------|-----|
+| Audio embedding Linear(C_latent -> 1024) | `xavier_uniform_` + `zeros_` bias | Standard linear init |
+| Stream 1 blocks (self-attn Q/K/V/O) x28 | `xavier_uniform_` + `zeros_` bias | Standard transformer init |
+| Stream 1 blocks (FFN) x28 | `xavier_uniform_` + `zeros_` bias | Standard transformer init |
+| Stream 1 RMSNorm x28 | `ones_` weight | Standard norm init |
+| **Modulation MLP** (timestep -> 6x1024) | **`zeros_`** weight and bias | DiT convention |
+| **FinalVidLayerPacked linear** (1024 -> C_latent) | **`zeros_`** weight and bias | DiT convention |
+| **FinalVidLayerPacked adaLN** (1024 -> 2048) | **`zeros_`** weight and bias | DiT convention |
+| Audio timestep embedding | Sinusoidal (fixed) + MLP (xavier) | Standard DiT |
+
+Where C_latent = 20 for MMAudio (16kHz, ~31.25 latent frames/sec), 128 for Hunyuan DAC (48kHz, 50 frames/sec).
+
+**Key insight**: Zeros init on modulation and output projection means at init, the audio stream contributes **zero** to the residual. The model starts as a pure (frozen) text LLM. Audio generation is learned from scratch — the zero-init provides a stable starting point (no random noise injected into text representations at step 0).
+
+### What Transfers vs What's Random
+
+```
+Qwen3-0.6B pretrained checkpoint (osc://sam/qwen_3_single_weights_0_6B.pt)
+  |-- Text embedding (151,936 -> 1024)       Y loads, frozen
+  |-- 28 x BagelMultiStreamBlock
+  |     |-- Stream 0 (text attn, FFN, norm)  Y loads, frozen
+  |     |-- Stream 1 (audio attn, FFN, norm) X random (xavier), trainable
+  |           |-- Modulation MLP             X random (zeros), trainable
+  |-- Text out_proj (1024 -> 151,936)         Y loads, frozen
+  |-- Audio embedding (C_latent -> 1024)      X random (xavier), trainable
+  |-- Audio out_proj (1024 -> C_latent)       X random (zeros), trainable
+  |-- Audio timestep embedding               X random (xavier), trainable
+```
+
+### Trainable Parameter Count (0.6B model)
+
+With frozen text stream, ~50% of the 0.6B parameters are trainable:
+- Stream 1 blocks: ~300M params (self-attn, FFN, modulation per block x28)
+- Audio embedding + out_proj: ~0.02M params (tiny — C_latent is only 20)
+- Timestep embedding: ~2M params
+- Total trainable: ~300M (vs ~600M if training everything)
+
+This halves optimizer memory and speeds up training.
+
+---
+
+## Batch Size Metric: "Minutes of Audio per Step"
+
+### The Problem
+
+Traditional batch size metrics (number of samples, number of tokens) are misleading for audio training:
+- "32 samples" could mean 32 × 2s clips = 1 min of audio, or 32 × 30s clips = 16 min of audio
+- "8000 tokens" depends on the VAE's compression ratio (MMAudio: 31.25 frames/sec, DAC: 50 frames/sec)
+- Comparing across different VAEs, sample rates, or duration bucketing strategies becomes apples-to-oranges
+
+### The Metric
+
+**Minutes of audio per gradient step** is the natural unit for T2A training throughput:
+
+```
+audio_minutes_per_step = num_clips × avg_clip_duration / 60
+```
+
+This is directly comparable across:
+- Different numbers of GPUs (more GPUs = more clips = more minutes)
+- Different VAEs (MMAudio vs DAC compress differently, but audio duration is the same)
+- Different packing strategies (bucketed vs greedy)
+- Different sequence lengths (max_num_tokens)
+
+### Concrete Comparison
+
+| Run | GPUs | Config | Clips/step | Avg duration | Audio/step |
+|-----|------|--------|-----------|--------------|------------|
+| **Reference** (Ray3 T2A 2.9B) | 32 | bucketed [5-15s], batch=[32,24,16,12,8] | ~589 | ~10s | **~98 min** |
+| **Our PoC** (Omni 0.6B, max_num_tokens=8000) | 8 | packed, variable length | ~240 | ~7s | **~28 min** |
+| **Our PoC** (Omni 0.6B, max_num_tokens=4000) | 8 | packed, variable length | ~120 | ~7s | **~14 min** |
+
+The reference run processes ~98 minutes of audio per gradient update across 32 GPUs. Our 8-GPU PoC at max_num_tokens=8000 processes ~28 minutes — roughly proportional to the GPU count ratio (8/32 = 25% GPUs, 28/98 = 29% audio throughput).
+
+### Per-GPU Efficiency
+
+Another useful view — **audio minutes per GPU per step**:
+
+| Run | Audio/GPU/step |
+|-----|---------------|
+| Reference (32 GPUs) | ~3.1 min/GPU |
+| Our PoC (8 GPUs, 8K tokens) | ~3.5 min/GPU |
+| Our PoC (8 GPUs, 4K tokens) | ~1.8 min/GPU |
+
+At max_num_tokens=8000, our per-GPU efficiency is comparable to the reference run.
+
+### Synthetic Example: From Raw Data to Packed Batch
+
+#### Step 1: One Training Sample
+
+A single row from `internal-audio-v2-english`:
+
+```
+Lance row:
+  audio_bytes: [<576810 bytes of WAV data>]      # 5.4s speech at 48kHz
+  whisperx_asr_content: '[SPEAKER_00]"that as you continue to subscribe and listen to our"'
+  language: "en"
+  round1_pass_all_filter: 1
+  segment_duration: 5.408
+  sample_rate: 48000
+```
+
+After the pipeline processes this row:
+
+```
+1. RowFieldFilter:    checks language="en" and round1_pass_all_filter=1  -> PASS
+2. AudioDecoder:      decode WAV bytes, resample 48kHz -> 16kHz
+                      output: audio_tensor shape (86528,) = 5.408s × 16000 Hz
+3. AudioToX:          peak normalize, clamp to [-1, 1]
+4. OmniT2AAudio:      create sequence plan:
+                        [TEXT] transcript, 42 text tokens (causal attention)
+                        [AUDIO] 169 audio tokens = ceil(86528 / 512) (noise attention)
+5. Tokenizer:         tokenize text, assign position IDs
+
+Result: one sample = 42 text tokens + 169 audio tokens = 211 tokens total
+```
+
+#### Step 2: Packing Multiple Samples
+
+The packing loop accumulates samples until `max_num_tokens=8000`:
+
+```
+Sample A: "that as you continue to subscribe..."     42 text +  169 audio =  211 tokens (5.4s)
+Sample B: "the weather today is sunny and warm"       38 text +  125 audio =  163 tokens (4.0s)
+Sample C: "I think the most important thing is..."    55 text +  250 audio =  305 tokens (8.0s)
+...
+Sample Z: "welcome back to the show everyone"         35 text +  156 audio =  191 tokens (5.0s)
+                                                                     ─────────────────────
+                                                              Total: ~8000 tokens (28 samples)
+```
+
+The packed sequence on ONE GPU:
+
+```
+[txtA][audioA][txtB][audioB][txtC][audioC]...[txtZ][audioZ][PAD]
+  42    169     38    125     55    250   ...   35    156    ←pad to 8000→
+
+Total: 8000 tokens = 28 samples packed end-to-end
+```
+
+This is ONE rank's batch. With 8 GPUs, total = 28 × 8 = 224 samples per gradient step.
+
+#### Step 3: Attention Mask (FlexAttention Block Mask)
+
+Each sample is isolated — tokens can only attend within their own sample:
+
+```
+             txtA  audA  txtB  audB  txtC  audC  ...  PAD
+             (42)  (169) (38)  (125) (55)  (250)
+    txtA  [ causal  .     .     .     .     .    ...   .  ]
+    audA  [  full  noise   .     .     .     .    ...   .  ]
+    txtB  [   .     .   causal   .     .     .    ...   .  ]
+    audB  [   .     .    full  noise   .     .    ...   .  ]
+    txtC  [   .     .     .     .   causal   .    ...   .  ]
+    audC  [   .     .     .     .    full  noise  ...   .  ]
+     ...
+    PAD   [   .     .     .     .     .     .    ...   .  ]
+
+    . = blocked (cross-sample or padding)
+```
+
+Zooming into Sample B (38 text + 125 audio = 163 tokens):
+
+```
+                t0  t1  t2  ... t37 | a0   a1   a2  ... a124
+                <-- 38 text ------> | <---- 125 audio ------>
+
+    t0         [ Y   .   .       .  |  .    .    .        .  ]
+    t1         [ Y   Y   .       .  |  .    .    .        .  ]
+    t2         [ Y   Y   Y       .  |  .    .    .        .  ]  <- text: causal
+    ...                                                          (sees only prior text)
+    t37        [ Y   Y   Y  ...  Y  |  .    .    .        .  ]
+
+    a0         [ Y   Y   Y  ...  Y  |  Y    Y    Y  ...   Y  ]
+    a1         [ Y   Y   Y  ...  Y  |  Y    Y    Y  ...   Y  ]  <- audio: noise/full
+    a2         [ Y   Y   Y  ...  Y  |  Y    Y    Y  ...   Y  ]  (sees ALL text + ALL audio)
+    ...
+    a124       [ Y   Y   Y  ...  Y  |  Y    Y    Y  ...   Y  ]
+
+    Y = attends    . = blocked
+```
+
+Key properties:
+- **Audio -> Text**: YES (audio tokens attend to all text tokens in the same sample)
+- **Text -> Audio**: NO (text tokens use causal mask, audio comes after text)
+- **Cross-sample**: NO (Sample A cannot see Sample B)
+- **Padding**: NO (padding tokens are masked out)
+
+#### Detailed Walkthrough: Two Samples Through the MoT Pipeline
+
+Let's trace exactly how two samples flow through concatenation, stream assignment, and attention.
+
+**Sample A**: transcript="Hello world", 3 text tokens, 5 audio tokens
+**Sample B**: transcript="Good morning", 4 text tokens, 3 audio tokens
+
+##### 1. Concatenation into One Packed Sequence
+
+The two samples are concatenated end-to-end into a single flat sequence of length 15:
+
+```
+Position:    0    1    2    3    4    5    6    7    8    9   10   11   12   13   14
+Token:      tA0  tA1  tA2  aA0  aA1  aA2  aA3  aA4  tB0  tB1  tB2  tB3  aB0  aB1  aB2
+            |<--- Sample A: 3 text + 5 audio --->|  |<--- Sample B: 4 text + 3 audio -->|
+```
+
+The data loader produces these masks (each is a boolean vector of length 15):
+
+```
+text_token_mask:  T  T  T  .  .  .  .  .  T  T  T  T  .  .  .     (7 text tokens total)
+vae_token_mask:   .  .  .  T  T  T  T  T  .  .  .  .  T  T  T     (8 audio tokens total)
+```
+
+And per-sample boundaries for attention:
+
+```
+sample_lens:  [8, 7]                              (Sample A = 8 tokens, Sample B = 7 tokens)
+split_lens:   [3, 5, 4, 3]                        (txtA=3, audA=5, txtB=4, audB=3)
+attn_modes:   [causal, noise, causal, noise]       (text=causal, audio=noise, alternating)
+```
+
+##### 2. Stream Assignment: Text Stream vs Audio Stream
+
+The model's preprocess separates the packed sequence into two streams using the masks:
+
+```
+Stream 0 (text/understanding):
+  Extract tokens where text_token_mask=True:
+    tokens:      tA0  tA1  tA2  tB0  tB1  tB2  tB3       (7 tokens)
+    positions:    0    1    2    8    9   10   11           (from position_ids)
+    RoPE:        cos/sin computed from positions             (Qwen3RotaryEmbedding)
+    modulation:  None                                        (text has no timestep)
+
+Stream 1 (audio/generation):
+  Extract tokens where vae_token_mask=True:
+    tokens:      aA0  aA1  aA2  aA3  aA4  aB0  aB1  aB2   (8 tokens)
+    positions:    3    4    5    6    7   12   13   14       (continues from text)
+    RoPE:        cos/sin computed from positions             (same Qwen3RotaryEmbedding)
+    modulation:  timestep -> 6 x hidden_dim adaLN params    ("double" modulation)
+```
+
+Each stream computes its own Q, K, V independently.
+
+##### 3. Pack into Joint Attention
+
+The two streams' Q/K/V are concatenated and reordered back into the original packed sequence order using `scatter_indices`:
+
+```
+Before packing (concatenated order):
+  [tA0 tA1 tA2 tB0 tB1 tB2 tB3 | aA0 aA1 aA2 aA3 aA4 aB0 aB1 aB2]
+   <---- stream 0 (7 tokens) --> | <---- stream 1 (8 tokens) -------->
+
+After packing (original interleaved order via scatter_indices):
+  [tA0 tA1 tA2 aA0 aA1 aA2 aA3 aA4 tB0 tB1 tB2 tB3 aB0 aB1 aB2]
+   pos 0   1   2   3   4   5   6   7   8   9  10  11  12  13  14
+```
+
+##### 4. FlexAttention with Block Mask
+
+A single FlexAttention call runs on the packed Q/K/V with a block mask that encodes three rules simultaneously:
+
+**Rule 1 — Sample isolation**: tokens from Sample A cannot attend to Sample B and vice versa.
+**Rule 2 — Text is causal**: each text token only sees previous text tokens in its sample.
+**Rule 3 — Audio sees everything**: each audio token sees all text + all audio in its sample.
+
+```
+Q \ K   tA0 tA1 tA2 aA0 aA1 aA2 aA3 aA4 tB0 tB1 tB2 tB3 aB0 aB1 aB2
+
+tA0      Y   .   .   .   .   .   .   .  | .   .   .   .   .   .   .
+tA1      Y   Y   .   .   .   .   .   .  | .   .   .   .   .   .   .
+tA2      Y   Y   Y   .   .   .   .   .  | .   .   .   .   .   .   .
+aA0      Y   Y   Y   Y   Y   Y   Y   Y  | .   .   .   .   .   .   .
+aA1      Y   Y   Y   Y   Y   Y   Y   Y  | .   .   .   .   .   .   .
+aA2      Y   Y   Y   Y   Y   Y   Y   Y  | .   .   .   .   .   .   .
+aA3      Y   Y   Y   Y   Y   Y   Y   Y  | .   .   .   .   .   .   .
+aA4      Y   Y   Y   Y   Y   Y   Y   Y  | .   .   .   .   .   .   .
+         ─────────────────────────────────+────────────────────────────
+tB0      .   .   .   .   .   .   .   .  | Y   .   .   .   .   .   .
+tB1      .   .   .   .   .   .   .   .  | Y   Y   .   .   .   .   .
+tB2      .   .   .   .   .   .   .   .  | Y   Y   Y   .   .   .   .
+tB3      .   .   .   .   .   .   .   .  | Y   Y   Y   Y   .   .   .
+aB0      .   .   .   .   .   .   .   .  | Y   Y   Y   Y   Y   Y   Y
+aB1      .   .   .   .   .   .   .   .  | Y   Y   Y   Y   Y   Y   Y
+aB2      .   .   .   .   .   .   .   .  | Y   Y   Y   Y   Y   Y   Y
+
+Y = attends    . = blocked    | = sample boundary
+```
+
+Read any row to see what that token attends to:
+- **tA1** (text token 1 of Sample A): sees tA0, tA1 only (causal within Sample A's text)
+- **aA2** (audio token 2 of Sample A): sees ALL of tA0-tA2 + aA0-aA4 (full access within Sample A)
+- **tB2** (text token 2 of Sample B): sees tB0, tB1, tB2 only (causal within Sample B's text)
+- **aB0** (audio token 0 of Sample B): sees ALL of tB0-tB3 + aB0-aB2 (full access within Sample B)
+- **aA4 -> tB0**: BLOCKED (cross-sample boundary)
+
+##### 5. Unpack Back to Streams
+
+After attention, the output is unpacked back into two streams using `packed_und_token_indexes` and `packed_gen_token_indexes`:
+
+```
+Attention output (packed, 15 tokens):
+  [oA0 oA1 oA2 oA3 oA4 oA5 oA6 oA7 oB0 oB1 oB2 oB3 oB4 oB5 oB6]
+
+Unpack to Stream 0 (text, 7 tokens):
+  [oA0 oA1 oA2 oB0 oB1 oB2 oB3]  <- text outputs (used by text postprocess)
+
+Unpack to Stream 1 (audio, 8 tokens):
+  [oA3 oA4 oA5 oA6 oA7 oB4 oB5 oB6]  <- audio outputs (used by audio postprocess)
+```
+
+Each stream then goes through its own post-SDPA processing (residual + FFN + modulation for audio).
+
+##### 6. Loss Computation
+
+After 28 transformer blocks, the audio stream output is projected to latent dim (1024 -> 20) and the diffusion loss is computed:
+
+```
+Audio prediction (8 tokens, 20 channels):
+  [predA0 predA1 predA2 predA3 predA4 predB0 predB1 predB2]
+
+Target (rectified flow velocity):
+  [targA0 targA1 targA2 targA3 targA4 targB0 targB1 targB2]
+
+Loss = MSE(prediction, target) averaged over all 8 audio tokens
+```
+
+Text stream output is discarded (frozen, no CE loss in T2A mode).
+
+#### Step 4: What the Model Sees
+
+For each sample in the pack, the model:
+1. **Text stream** (frozen Qwen3-0.6B): encodes the transcript into text representations
+2. **Audio stream** (trainable): receives noisy audio latents + text conditioning via packed attention
+3. **Loss**: MSE between model's audio prediction and the rectified flow target (velocity)
+
+The text representations flow into audio via the packed attention — audio Q tokens fetch text K/V, giving the audio stream full access to the transcript. Text tokens never see audio (causal mask), so the frozen text stream produces the same representations regardless of what audio is present.
+
+### Reading the Training Logs
+
+`num_samples` in the training log is the number of audio clips in **one rank's** packed batch (NOT the total across all GPUs):
+
+```
+[48] diffusion_loss: 1.699, num_samples: 28.000, ...
+                            ^^^^^^^^^^^^^^^^
+                            28 clips on THIS GPU, not total
+```
+
+Total throughput per step:
+```
+total_clips  = num_samples × num_GPUs = 28 × 8 = 224 clips
+audio_per_step = total_clips × avg_duration = 224 × 7s ≈ 26 min
+```
+
+### Known Issue: Lance S3 Memory Leak (2026-04-09)
+
+Our overnight run was SIGKILL'd at step 136 (~18 min). Root cause: **Lance Rust-side memory leak** when reading from S3 with random access. This is a known issue across all T2A training (Slack thread: #training-updates 2026-04-06).
+
+**Root cause** (from Richard Cai's investigation, PR #7121):
+- Lance caches fragment metadata in Rust memory for each new fragment accessed via S3
+- The cache grows with each `ds.take()` call touching new fragments and is **never evicted**
+- With 222M-row datasets (2,227 fragments) and shuffled random access: ~350 MB/hr per worker
+- This is NOT Python-level, NOT PyArrow, NOT audio decode — it's in Lance's Rust native code
+
+**Fix** (PR #7121, merged): Recreate the `lance.dataset()` handle every 50 reads + `gc.collect()` + `pa.release_unused()`. However, this fix is in koba V2's `LanceReader` — our data loader uses V1's `AllModalityDatasetWithMultithreading` → `LanceDataset` which does NOT have this fix.
+
+**Options**:
+1. Port the connection-reset fix to `LanceDataset` / `AllModalityDatasetWithMultithreading`
+2. Switch to koba V2's `LanceReader` (bigger refactor)
+3. Reduce number of concurrent Lance readers to slow the leak (workaround)
+
+### Memory vs Batch Size (0.6B model, 8× H100 80GB)
+
+| max_num_tokens | GPU memory | Clips/step (total) | Audio/step | Status |
+|---------------|------------|-------------------|------------|--------|
+| 4,000 | 13 GB | ~120 | ~14 min | OK |
+| 8,000 | 33 GB | ~224 | ~26 min | OK (current) |
+| 16,000 | OOM | — | — | 67GB used + 15GB alloc failed |
+| 26,000 | OOM | — | — | 45GB used + 40GB alloc failed |
+
+The OOM at 16K+ is likely from FlexAttention block mask compilation spikes and FSDP all-gathering both frozen text + trainable audio weights. With `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, 12K-16K may work.
+
+---
+
+## Overnight PoC Run Log (2026-04-09)
+
+### Run: omni_t2a_0_6b_pretrained
+
+W&B: https://wandb.ai/luma-ai/omni-t2a/runs/g0ebocom
+
+| Setting | Value |
+|---------|-------|
+| Model | 0.6B (28 layers, hidden=1024), pretrained Qwen3-0.6B text stream (frozen) |
+| Audio stream | Random init, trainable (~300M params) |
+| Audio VAE | MMAudio 16k (20-dim, scaling=1/2.3563) |
+| Dataset | `internal-audio-v2-english` (multilingual table + runtime RowFieldFilter) |
+| max_num_tokens | 8000 |
+| FSDP | GenericTransformerHSDP2, intra_node_shard=8 |
+| Loss | Pure diffusion MSE (no CE) |
+| Checkpoint | Saved at step 200 to `os://ai-lumalabs-checkpoints-ap-se-2/root/omni_t2a_0_6b_pretrained/00000200/denoiser/` |
+
+### Training Progress (before crash)
+
+| Step | diffusion_loss | grad_norm | step_time | data_time | num_samples/rank |
+|------|---------------|-----------|-----------|-----------|-----------------|
+| 1 | 1.73 | 3.05 | 24.6s | 8.5s | ~25 (warmup) |
+| 50 | 1.68 | 2.74 | 7.3s | 2.0s | ~28 |
+| 100 | 1.65 | 2.80 | 7.3s | 2.0s | ~30 |
+| 200 | 1.56 | 2.79 | 7.3s | 2.1s | ~30 |
+| ~300 | ~1.5 | ~2.7 | ~7.3s | ~2.0s | ~30 |
+
+Loss decreased from 1.73 to ~1.5 over 300 steps. Gradients stable (~2.7).
+
+### Crash: OOM at ~300 Steps (Lance S3 Memory Leak)
+
+Job killed by system cgroup OOM after ~300 steps (~37 min). Same root cause as before: Lance Rust-side fragment metadata cache grows unbounded when reading from S3 with random access.
+
+**What we tried and what didn't work:**
+
+| Approach | Result |
+|----------|--------|
+| Periodic `gc.collect()` + `pa.release_unused()` in main thread | Slowed leak slightly (136 → 300 steps before OOM) but didn't fix it. GC runs in main thread, leak is in V1 loader threads |
+| V2 `LanceReader` (has the fix) | Lance `ds.take()` panics in Rust (`take.rs:273 unwrap on None`) when called from multiple threads, even with thread-local readers. Reverted |
+| Thread-local `LanceReader` instances | Same Rust panic — `ds.take()` is not thread-safe |
+
+**Root cause**: The fix in PR #7121 periodically recreates the `lance.dataset()` handle to flush the Rust cache. This fix is in V2 `LanceReader.read_batch()` (which uses `ds.take()`). But V1 `AllModalityDatasetWithMultithreading` uses `LanceDataset` which iterates via PyArrow batch iteration — a different code path. The V1 `LanceDataset` holds one persistent Lance handle per dataset that is never recreated.
+
+**V2 `LanceReader` unusable because**: `ds.take(indices)` (used by V2 reader) triggers a Rust panic when called from ThreadPoolExecutor threads. The V1 path uses `ds.to_batches()` / scanner iteration which doesn't panic. This is a Lance library bug — `take()` is not thread-safe even with independent dataset handles.
+
+### Performance Analysis
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| step_time | 7.3s | 4.9x slower than reference (1.5s) |
+| data_time | 2.0s (26% of step) | Runtime RowFieldFilter rejects 25%+ of reads |
+| compute_time | 5.3s | Forward (frozen text + trainable audio) + backward + optim |
+| GPU memory | 33 GB / 80 GB | 41% utilization |
+| GPU util | ~67% (drops to 0% during data loading) | Data loading is visible bottleneck |
+
+**Why 7.3s/step vs reference 1.5s/step:**
+
+1. **Data loading (2.0s)**: Runtime filtering wastes 25%+ of Lance reads. Reference has no runtime filter.
+2. **Packed attention on 8000 tokens**: We pack 28 clips into one 8000-token FlexAttention call. Reference does independent self-attention on ~313 tokens per clip + separate cross-attention.
+3. **Frozen text forward**: We run frozen Qwen3 text stream through all 28 blocks every step. Reference uses UMT5-XXL as a separate encoder (compute once, cache).
+
+### Deep Dive: Why V2 LanceReader Panicked in Our Setup
+
+When we tried using V2 `LanceReader` directly (medium fix attempt), we hit:
+```
+thread '<unnamed>' panicked at take.rs:273:27: called Option::unwrap() on a None value
+```
+
+**Investigation**: `AudioBatchingDatasetV2` uses the EXACT same pattern — one shared `self._reader` (LanceReader) called from multiple ThreadPoolExecutor worker threads via `self._reader.read_batch()`. The comment in their code says `"# Read from Lance (I/O is thread-safe)"`. So why does it work for them?
+
+**Root cause**: The connection reset code in `LanceReader.read_batch()` (PR #7121) does:
+```python
+# Thread A (every 50 reads):
+self._connections.pop(dataset_name, None)   # removes connection
+gc.collect()
+
+# Thread B (concurrent):
+ds = self._get_connection(dataset_name)      # gets connection from dict
+table = ds.take(indices)                     # uses connection
+```
+
+There's a **race condition**: Thread A pops the connection while Thread B is in the middle of `ds.take()` on the same handle. Thread B holds a reference to the old `ds` object that Thread A just destroyed → Rust internal state is corrupted → panic.
+
+**Why `AudioBatchingDatasetV2` rarely hits this**: With `_connection_reset_interval=50` and only 2-4 workers, the probability of Thread A resetting at the exact moment Thread B is mid-`take()` is very low. It may occasionally panic, but the retry loop (`max_retries=5`) catches it. Our setup with 8 workers hit the timing window more frequently.
+
+**Why even thread-local readers panicked**: We tried creating independent `LanceReader` instances per thread. Each thread had its own `_connections` dict and own `lance.dataset()` handle. But `lance.dataset()` may share **process-level Rust state** (e.g., a global async runtime, connection pool, or fragment cache). Multiple independent handles doing `ds.take()` concurrently can still conflict at the Rust level.
+
+### Options to Fix the Memory Leak
+
+#### Option 1: Port V2 fix to V1 `AllModalityDatasetWithMultithreading`
+
+The V1 loader uses a different Lance read path than V2. Instead of `ds.take(indices)` (random access by row ID), V1 uses `ds.to_batches()` / scanner iteration (sequential batch reading). This path does NOT trigger the Rust panic.
+
+The fix: add periodic `lance.dataset()` handle recreation in V1's loader thread:
+
+```python
+# In _batch_loader_worker_modality() of all_modality_dataset_with_multithreading.py:
+read_count = 0
+while not self._stop_event.is_set():
+    read_count += 1
+    if read_count % 50 == 0:
+        # Recreate Lance handles to flush Rust fragment metadata cache
+        for i, ds_config in enumerate(original_configs[modality]):
+            self.datasets[modality][i] = ds_config.setup()  # new handle
+        gc.collect()
+        pa.default_memory_pool().release_unused()
+
+    raw_batch, uri = self._get_next_raw_batch(modality)
+    raw_batch = raw_batch.to_pylist()
+    # ... enqueue items
+```
+
+This is safe because the loader thread is the **only thread** that calls `_get_next_raw_batch()` for a given modality — no concurrent access to the Lance handle within the same modality. The processor threads receive already-read Python dicts, never touching Lance directly.
+
+| Pro | Con |
+|-----|-----|
+| Fixes the leak at its source | Modifies shared `lib/koba/` infrastructure |
+| All V1 users benefit (omni T2I, VLM, etc.) | Needs code review from koba owners |
+| Low risk: loader thread is single-writer per modality | Need to store original configs for recreation |
+| No architecture change to our data loader | |
+
+#### Option 2: Use `AudioBatchingDatasetV2` as data source + bridge layer
+
+`AudioBatchingDatasetV2` is the proven Ray3 T2A data loader. It has V2 `LanceReader` built in, plus duration bucketing, ThreadPoolExecutor, per-bucket queues, TP broadcast — all battle-tested. The reference run (`ovah4wwn`) ran for days without OOM.
+
+The architecture:
+
+```
+AudioBatchingDatasetV2 (existing, proven)
+  ├── LanceReader (V2, with memory leak fix)
+  ├── ThreadPoolExecutor (2-4 workers, thread-local pipelines)
+  ├── Duration bucketing (per-bucket queues)
+  └── Outputs: {"x": audio_tensor (B, L), "txt": caption_string, ...}
+             flat batch, same-duration clips, already decoded + augmented
+
+                              ↓
+
+Bridge Layer (new code)
+  ├── For each sample in the flat batch:
+  │     1. Create sequence plan: [TEXT(caption), AUDIO(audio_tensor)]
+  │     2. OmniAddTokenizedSequenceElement
+  │     3. OmniElementAudio (token masks, vae_token_mask=True)
+  │     4. OmniElementText + OmniQwen3Tokenizer
+  │     5. OmniPositionIDMRoPE
+  ├── Accumulate tokenized samples
+  └── pack_sequence() → packed batch dict
+
+                              ↓
+
+OmniT2ATrainer.step() (unchanged)
+  ├── frozen audio encoder(x_audio) → z0
+  └── BagelT2ALoss(denoiser, z0, **batch)
+```
+
+The key difference: `AudioBatchingDatasetV2` manages the `LanceReader` and `ThreadPoolExecutor` as a **single cohesive unit** — the reader is created, initialized, and used within the same class's lifecycle. The worker threads call `self._reader.read_batch()` in a controlled loop with error handling and retry. The race condition on connection reset is rare and handled by retries.
+
+Our bridge layer only needs to:
+1. Iterate over `AudioBatchingDatasetV2` (get flat batches)
+2. Run omni tokenization processors on each sample
+3. Pack into omni packed format
+
+| Pro | Con |
+|-----|-----|
+| Uses battle-tested infrastructure (no memory leak) | More code: bridge layer (~100-150 lines) |
+| Gets duration bucketing for free (uniform batches) | Two-stage pipeline (AudioBatchingDatasetV2 → bridge → trainer) |
+| Doesn't modify shared `lib/koba/` code | Audio already decoded by the time bridge runs (can't skip decode for filtered rows) |
+| Reference run validates this exact data path | Need to configure AudioBatchingDatasetV2 in addition to omni configs |
+| Thread safety proven in production | |
+
+### Recommendation
+
+**Option A** is simplest and lowest risk for unblocking the PoC tonight (20 lines, single-writer per modality). **Option C** (pre-encode latents) is the best long-term solution for production — eliminates both the memory leak and the audio decode overhead.
+
+---
+
+## Detailed Fix Options for Lance S3 Memory Leak (2026-04-09)
+
+### Background: The Core Constraint
+
+Lance `ds.take()` and scanner iteration from S3 leak Rust-side fragment metadata cache. The ONLY known fix is **periodically recreating the `lance.dataset()` handle** (drops the Rust cache). PR #7121 implements this in V2 `LanceReader` (connection reset every 50 reads + `gc.collect()` + `pa.release_unused()`).
+
+The challenge: this fix lives in V2 `LanceReader.read_batch()`, but our data loader uses V1 `AllModalityDatasetWithMultithreading` → `LanceDataset` (different code path). And when we tried using V2 `LanceReader` directly from ThreadPoolExecutor threads, Lance's `ds.take()` panicked in Rust due to thread safety issues.
+
+### Key Threading Analysis
+
+**V1 `AllModalityDatasetWithMultithreading` threading model:**
+```
+Main thread: creates AllModalityDatasetWithMultithreading in __init__
+  └── __init__ creates LanceDataset objects: self.datasets[modality] = [LanceDataset, ...]
+
+Loader threads (1 per modality, started in _start_pipeline):
+  └── _batch_loader_worker_modality(modality):
+      while not stop:
+          raw_batch, uri = self._get_next_raw_batch(modality)  # reads from self.datasets[modality]
+          raw_batch = raw_batch.to_pylist()
+          for item in raw_batch:
+              items_to_process_queue[modality].put(item)
+
+Processor threads (N shared, round-robin across modalities):
+  └── _processor_worker(thread_id):
+      while not stop:
+          item = items_to_process_queue[modality].get()
+          processed = _apply_processors(processors, item, modality)  # Python processing only
+          processed_items_queue[modality].put(processed)
+```
+
+**Critical insight**: The loader thread for a given modality is the **ONLY thread** that touches `self.datasets[modality]` (the Lance handles). Processor threads only receive already-read Python dicts — they never touch Lance. This makes Option A safe.
+
+**V2 `LanceReader` threading model (used by `AudioBatchingDatasetV2`):**
+```
+Main thread: creates ONE shared self._reader = LanceReader(...)
+  └── self._reader.initialize_for_worker()
+  └── self._executor = ThreadPoolExecutor(N workers)
+
+Worker threads (N, from ThreadPoolExecutor):
+  └── each calls self._reader.read_batch(name, indices)
+      └── self._reader._get_connection(name)  # shared self._connections dict
+      └── ds.take(indices)                     # Lance Rust code
+      └── every 50 reads: self._connections.pop(name)  # RACE CONDITION
+```
+
+**Race condition**: Thread A does `_connections.pop(name)` while Thread B is mid-`ds.take()` on the same handle. Thread B's handle is partially destroyed → Rust panic at `take.rs:273`.
+
+`AudioBatchingDatasetV2` survives this because with 2-4 workers and reset every 50 reads, the race window is tiny. Our setup with 8 workers hit it more often.
+
+### Option A: Fix V1 Loader Thread (Simplest, Lowest Risk)
+
+**What**: Add periodic `lance.dataset()` handle recreation in V1's per-modality loader thread.
+
+**Where**: `lib/koba/koba/feeder/all_modality_dataset_with_multithreading.py`, in `_batch_loader_worker_modality()` (around line 282-317).
+
+**Why it's safe**: The loader thread for modality "t2a" is the ONLY thread that reads from `self.datasets["t2a"]`. No concurrent access. The processor threads only see Python dicts.
+
+**Implementation** (~20 lines):
+
+```python
+# In _batch_loader_worker_modality(modality):
+import gc
+import pyarrow as pa
+
+read_count = 0
+CONNECTION_RESET_INTERVAL = 50
+
+while not self._stop_event.is_set():
+    # Periodic Lance handle recreation to flush Rust fragment metadata cache
+    read_count += 1
+    if read_count % CONNECTION_RESET_INTERVAL == 0:
+        for i, ds_obj in enumerate(self.datasets[modality]):
+            # Recreate the lance.dataset() handle
+            old_uri = ds_obj.dataset.uri
+            storage_opts = {
+                "timeout": "120s",
+                "region": "ap-southeast-2",
+                "connect_timeout": "60s",
+                "request_timeout": "600s",
+                "client_max_retries": "20",
+                "client_retry_timeout": "600",
+                "download_retry_count": "5",
+            }
+            ds_obj.dataset = lance.dataset(old_uri, storage_options=storage_opts)
+        gc.collect()
+        try:
+            pa.default_memory_pool().release_unused()
+        except Exception:
+            pass
+
+    # ... existing code: raw_batch, uri = self._get_next_raw_batch(modality)
+```
+
+**Effort**: ~20 lines in one file.
+**Risk**: Low — single-writer per modality, no threading concern.
+**Scope**: Modifies shared `lib/koba/` but change is minimal and isolated to loader thread.
+**Benefit**: Fixes the memory leak for ALL V1 users (omni T2I, VLM, T2A).
+**Limitation**: Doesn't improve data loading performance (still single-threaded Lance reads per modality).
+
+### Option B: Use `AudioBatchingDatasetV2` + Bridge Layer
+
+**What**: Use the proven Ray3 T2A data loader (which has V2 `LanceReader` with the memory fix built in) as the data source, then add a bridge layer to convert its flat batch output to the omni packed sequence format.
+
+**Architecture**:
+
+```
+AudioBatchingDatasetV2 (existing, battle-tested)
+  ├── V2 LanceReader (with memory leak fix, retry, connection pooling)
+  ├── ThreadPoolExecutor (2-4 workers)
+  │     └── Each worker: sampler.get_indices() → reader.read_batch() → V1 pipeline
+  ├── Duration bucketing (per-bucket queues, uniform-length batches)
+  ├── Audio augmentation (RMS norm, peak norm, clamp via AudioToX in V1 pipeline)
+  └── Output: flat batch dict per bucket
+      {
+          "x": Tensor(batch_size, num_frames),     # decoded audio waveforms, all same duration
+          "txt": list[str],                          # transcript captions
+          "duration_bucket": float,                  # e.g., 5.04
+          "original_durations": list[float],         # actual durations before padding
+          "dataset_names": list[str],                # source dataset per sample
+      }
+
+                              ↓
+
+OmniT2ABridgeDataset (new, ~150 lines)
+  ├── Iterates over AudioBatchingDatasetV2 (gets flat batches)
+  ├── For each sample in the flat batch:
+  │     1. Create SequenceElement list:
+  │         [SequenceElement(type=TEXT, text_str=caption, loss=False, modality="t2a"),
+  │          SequenceElement(type=AUDIO, media=Media(data=audio_tensor), loss=True, modality="t2a")]
+  │     2. Run omni tokenization pipeline on the sequence plan:
+  │         - OmniAddTokenizedSequenceElement.Config().setup().forward(sample)
+  │         - OmniElementAudio.Config(compression_factor=512).setup().forward(sample)
+  │         - OmniElementText.Config().setup().forward(sample)
+  │         - OmniQwen3Tokenizer.Config().setup().forward(sample)
+  │         - OmniPositionIDMRoPE.Config(order="THW").setup().forward(sample)
+  │     3. Collect tokenized_sequence_plan
+  ├── Accumulate samples until max_num_tokens reached
+  └── pack_sequence(samples) → packed batch dict
+      {
+          "txt": Tensor,
+          "text_token_mask": Tensor,
+          "vae_token_mask": Tensor,
+          "audio_token_mask": Tensor,
+          "x_audio": list[Tensor],
+          "position_ids": Tensor,
+          "sample_lens": list[int],
+          "split_lens": list[int],
+          "attn_modes": list[str],
+          ...
+      }
+
+                              ↓
+
+OmniT2ATrainer.step() (unchanged)
+  ├── frozen MMAudio encoder(x_audio) → z0 latents
+  └── BagelT2ALoss(denoiser, z0, **batch)
+```
+
+**Where**: New file `projects/kuma/.../omni/bagel/configs/data/omni_t2a_bridge_dataset.py`.
+
+**Configuration**: The `AudioBatchingDatasetV2.Config` is created from our existing `OmniT2ADatasetConfig` parameters, or we create a separate config that wraps both.
+
+**Key code for the bridge** (pseudocode):
+
+```python
+class OmniT2ABridgeDataset(torch.utils.data.IterableDataset):
+    def __init__(self, audio_batching_config, max_num_tokens, ...):
+        self.audio_dataset = audio_batching_config.setup()  # AudioBatchingDatasetV2
+        self.max_num_tokens = max_num_tokens
+        # Create tokenization processors (one-time, main thread)
+        self.tokenizer = OmniQwen3Tokenizer.Config().setup()
+        self.position_id = OmniPositionIDMRoPE.Config(order="THW").setup()
+        # ... other processors
+
+    def __iter__(self):
+        curr_pack = []
+        curr_tokens = 0
+        for flat_batch in self.audio_dataset:
+            # flat_batch["x"] shape: (batch_size, num_frames)
+            # flat_batch["txt"]: list of caption strings
+            for i in range(flat_batch["x"].shape[0]):
+                audio_tensor = flat_batch["x"][i]  # (num_frames,)
+                caption = flat_batch["txt"][i]
+
+                # Build sequence plan
+                sample = {
+                    "sequence_plan": [
+                        SequenceElement(type=SequenceType.TEXT, text_str=caption,
+                                       loss=False, modality="t2a",
+                                       supervise_last_text_token=True),
+                        SequenceElement(type=SequenceType.AUDIO,
+                                       media=Media(media_type="audio", data=audio_tensor),
+                                       loss=True, modality="t2a"),
+                    ]
+                }
+
+                # Run tokenization pipeline
+                sample = self.add_tokenized(sample)
+                sample = self.element_audio(sample)
+                sample = self.element_text(sample)
+                sample = self.tokenizer(sample)
+                sample = self.position_id(sample)
+
+                tok_plan = sample["tokenized_sequence_plan"]
+                sample_len = sum(s.num_tokens for s in tok_plan)
+
+                if curr_tokens + sample_len > self.max_num_tokens and curr_pack:
+                    yield pack_sequence([s["tokenized_sequence_plan"] for s in curr_pack])
+                    curr_pack = []
+                    curr_tokens = 0
+
+                curr_pack.append(sample)
+                curr_tokens += sample_len
+```
+
+**Effort**: ~150 lines new code. No shared code modifications.
+**Risk**: Low — uses proven AudioBatchingDatasetV2 infrastructure.
+**Scope**: Only our T2A project files.
+**Benefit**: Memory leak fixed + duration bucketing + proven threading model.
+**Limitation**: Two-stage pipeline. Audio is decoded by AudioBatchingDatasetV2 before the bridge — can't skip decode for samples that would be filtered. Need to configure AudioBatchingDatasetV2 separately.
+
+### Option C: Pre-encode Audio Latents into a New Lance Table
+
+**What**: Run MMAudio encoder offline on the entire `internal-audio-v2-english` dataset. Save the resulting 20-dim latent tensors to a new Lance table. Training reads tiny latent tensors instead of 500KB raw audio bytes.
+
+**Why this helps**:
+1. **Memory leak**: Tiny columns (20×T floats ≈ 2KB per 5s clip) vs large audio bytes (500KB). Fragment metadata per read is proportionally smaller → leak grows 250x slower.
+2. **No audio decode at training time**: Latents are pre-computed. No MMAudio encoder forward pass needed in the trainer.
+3. **No frozen encoder GPU memory**: The ~73M param MMAudio encoder is no longer loaded on each GPU.
+4. **Faster data loading**: 2KB reads vs 500KB reads = 250x less S3 bandwidth per sample.
+
+**New Lance table schema**:
+
+```
+audio_latents: fixed_size_list<float32, 20>   # MMAudio latent channels (per frame)
+audio_latent_length: int32                     # number of latent frames (T)
+whisperx_asr_content: string                   # transcript
+language: string                               # language code
+segment_duration: float64                      # original audio duration in seconds
+```
+
+Or alternatively, store as a flat binary blob:
+
+```
+audio_latents_blob: binary                     # serialized tensor (20, T) as bytes
+audio_latent_frames: int32                     # T
+whisperx_asr_content: string
+```
+
+**Offline encoding job** (LAX or standalone script):
+
+```python
+# Pseudocode for the encoding job
+import lance
+import torch
+from kuma.projects.ray3_t2av.models.mmaudio import PretrainedMMAudioEncoder
+
+encoder = PretrainedMMAudioEncoder.Config(deterministic=True, mode="16k",
+                                          scaling_factor=1/2.3563).setup()
+encoder.eval().to("cuda")
+
+src_ds = lance.dataset("s3://...whisperx__multilingual_v1_compacted.lance")
+# Filter: round1_pass_all_filter=1 AND language='en'
+
+output_rows = []
+for batch in src_ds.to_batches(columns=["audio_bytes", "whisperx_asr_content", ...],
+                                filter="`round1_pass_all_filter` = 1 AND `language` = 'en'",
+                                batch_size=64):
+    for row in batch.to_pylist():
+        audio_bytes = row["audio_bytes"][0]  # unwrap list<binary>
+        waveform = decode_audio(audio_bytes, sample_rate=16000)
+        with torch.no_grad():
+            z = encoder(waveform.unsqueeze(0).cuda())  # (1, 20, T)
+        output_rows.append({
+            "audio_latents": z.squeeze(0).cpu().numpy(),  # (20, T)
+            "audio_latent_frames": z.shape[2],
+            "whisperx_asr_content": row["whisperx_asr_content"],
+            "segment_duration": row["segment_duration"],
+        })
+
+# Write new Lance table
+lance.write_dataset(pa.Table.from_pylist(output_rows),
+                    "s3://...internal_audio_v2_english_mmaudio_latents.lance")
+```
+
+**Modified trainer**: `OmniT2ATrainer.step()` would skip the audio encoding step:
+
+```python
+# Before (current):
+x_audio = batch["x_audio"]
+with trace_io("audio_encode"):
+    z0_list = []
+    for audio_tensor in x_audio:
+        z0_i = self.audio_encoder(audio_input)  # GPU forward pass per clip
+        z0_list.append(z0_i)
+z0 = torch.cat(z0_list, dim=2)
+
+# After (with pre-encoded latents):
+z0 = batch["audio_latents"].to(self.device)  # already encoded, just move to GPU
+```
+
+**Modified data loader**: Read `audio_latents` column instead of `audio_bytes`. The `OmniElementAudio` processor would read latent frames instead of raw audio frames for token count calculation.
+
+**Effort**: ~2 hours for encoding job + ~1 hour for trainer/loader modifications.
+**Risk**: Medium — need to manage a derived dataset (re-encode when encoder changes).
+**Scope**: New Lance table + modified trainer + modified data loader. No shared code changes.
+**Benefit**: Eliminates memory leak + audio decode time + frozen encoder memory. Fastest training.
+**Limitation**: Tied to one specific audio VAE (MMAudio 16k). If you switch to DAC, need to re-encode. The pre-encoded table is a snapshot — can't change augmentation (RMS norm etc.) at training time since raw audio is gone.
+
+### Option D: Fix V2 LanceReader Thread Safety
+
+**What**: Make `LanceReader.read_batch()` thread-safe by using per-thread connection tracking and reset, instead of the shared `_read_count` and `_connections` dict.
+
+**Where**: `lib/koba/koba/v2/core/reader.py`.
+
+**Implementation**:
+
+```python
+class LanceReader:
+    def __init__(self, config):
+        ...
+        self._thread_local = threading.local()  # per-thread state
+        # Remove shared: self._read_count, self._connection_reset_interval
+
+    def _get_thread_local_state(self):
+        if not hasattr(self._thread_local, 'connections'):
+            self._thread_local.connections = {}
+            self._thread_local.read_count = 0
+        return self._thread_local
+
+    def _get_connection(self, dataset_name: str) -> Any:
+        state = self._get_thread_local_state()
+        if dataset_name not in state.connections:
+            import lance
+            state.connections[dataset_name] = lance.dataset(
+                self.datasets[dataset_name],
+                storage_options=self.storage_config.to_storage_options(),
+            )
+        return state.connections[dataset_name]
+
+    def read_batch(self, dataset_name, indices, with_indices=True):
+        state = self._get_thread_local_state()
+        state.read_count += 1
+
+        # Per-thread connection reset (no race condition — only this thread's state)
+        if (self._connection_reset_interval > 0
+                and state.read_count % self._connection_reset_interval == 0):
+            state.connections.pop(dataset_name, None)
+            gc.collect()
+            try:
+                pa.default_memory_pool().release_unused()
+            except Exception:
+                pass
+
+        # ... rest of read_batch using self._get_connection(dataset_name)
+```
+
+**Key change**: `_connections` dict and `_read_count` move from shared instance state to `threading.local()`. Each thread has its own Lance handles and its own reset counter. No shared mutable state between threads → no race condition.
+
+**Backward compatibility**: `AudioBatchingDatasetV2` would automatically get the fix since it uses `LanceReader.read_batch()`. Single-threaded callers also work (main thread gets its own thread-local state).
+
+**Effort**: ~50 lines modifying `lib/koba/koba/v2/core/reader.py`.
+**Risk**: Medium — changes V2 shared code. Needs testing to ensure `AudioBatchingDatasetV2` still works. Also need to verify that `initialize_for_worker()` resets thread-local state properly after `fork()`.
+**Scope**: Shared `lib/koba/` code.
+**Benefit**: Fixes the race condition properly. Our V2 LanceReader approach (medium fix) would then work.
+**Limitation**: Doesn't fix V1 users (omni T2I/VLM). Each thread creates its own Lance connection → more S3 connections. Need to verify Lance handles are truly independent at the Rust level (process-level Rust state may still be shared).
+
+### Summary Comparison
+
+| | Option A | Option B | Option C | Option D |
+|---|---|---|---|---|
+| **What** | Fix V1 loader thread | AudioBatchingDatasetV2 + bridge | Pre-encode latents | Fix V2 reader thread safety |
+| **Effort** | ~20 lines | ~150 lines | ~2-3 hours | ~50 lines |
+| **Risk** | Low | Low | Medium | Medium |
+| **Fixes leak** | Yes | Yes | Yes (eliminates it) | Yes |
+| **Fixes perf** | No | Yes (bucketing) | Yes (no decode) | No |
+| **Modifies shared code** | Yes (minimal) | No | No | Yes |
+| **Benefits others** | Yes (all V1 users) | No (T2A only) | No (T2A only) | Yes (all V2 users) |
+| **Production-ready** | Good for short-term | Good for medium-term | Best for long-term | Good if V2 reader is the standard |
+| **Unblocks PoC tonight** | Yes | No (more code) | No (need encoding job) | Maybe (if test passes) |
+
+---
+
+## Medium-Term Roadmap
+
+Three task types with different loss structures:
+
+| Task | Input | Output | Loss |
+|------|-------|--------|------|
+| T2A (current) | text prompt | audio latents | diffusion only |
+| Understanding (A2T) | audio + text prompt | text response | CE only |
+| CoT generation | simple prompt | extended text -> audio | CE on text + diffusion on audio |
+| Multi-speaker | reference audios + text | speech audio | diffusion (interleaved audio/text input) |
+
+Multi-speaker format:
+```
+<speaker0> [audio_ref_0] <speaker1> [audio_ref_1]
+Prompt: generate "<speaker0> sentence one <speaker1> sentence two"
+-> [generated speech audio]
+```
+
+This requires the understanding stream to handle **interleaved text + audio input** (reference clips alongside text), similar to how ViT image features are injected in the omni vision model.
+
+---
+
 ## Next Steps
 
-- [ ] Multi-node Flyte launch config (study file)
-- [ ] Audio generation inference processor
-- [ ] Evaluation metrics (FAD, CLAP score) against reference run
-- [ ] Extend to 3-stream model (text + vision + audio) when ready to merge
+- [ ] Run 2B overnight PoC training
+- [ ] Audio generation inference processor (T2A sampling loop)
+- [ ] A2T support — audio understanding encoder in understanding stream
+- [ ] CoT generation — combined CE + diffusion loss
+- [ ] Multi-speaker / interleaved audio input
+- [ ] Sequence parallelism (Ulysses) for longer sequences
+- [ ] Multi-node Flyte launch config
+- [ ] Evaluation metrics (FAD, CLAP score)
