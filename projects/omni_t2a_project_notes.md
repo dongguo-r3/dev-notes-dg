@@ -1695,6 +1695,47 @@ Branch: `dongguo/omni-t2a-v2`
 
 Note: step_time is higher because this is earlier in torch.compile warmup. The previous V1 run's 7.3s was measured at step 200+. Option B step_time should converge to similar values.
 
+### Run Comparison: V1 vs Option B (300 steps)
+
+After 300 steps, compared the two runs side-by-side:
+
+- V1 run: https://wandb.ai/luma-ai/omni-t2a/runs/g0ebocom (orange, `omni_t2a_0_6b_pretrained`)
+- Option B run: https://wandb.ai/luma-ai/omni-t2a/runs/u27stj53 (green, `omni_t2a_0_6b_pretrained_v2`)
+
+| Metric | V1 (orange) | Option B (green) |
+|--------|-------------|------------------|
+| step_time | Stable ~7-10s | Baseline ~8-12s, frequent spikes to 20-40s, some extreme 60-80s |
+| num_samples | 20-35, stable | 20-40, comparable |
+| loss | 1.7 → 1.35 (smooth) | 1.7 → 1.5 (noisier, fewer effective steps) |
+| grad_norm | 2.0-3.0, stable | 2.0-3.0, comparable |
+| Memory | OOM at ~300 steps | Stable (no OOM) |
+
+**Diagnosis**: Option B solved the memory leak but introduced step_time instability. Root cause: `OmniT2ABridgeDataset` runs the full omni tokenization pipeline (6 processors: CFGDropout → AddTokenized → ElementAudio → ElementText → Tokenizer → PositionID) **in the main thread** (`num_workers=0`). When `AudioBatchingDatasetV2` has an S3 latency spike or its internal buffer empties, the main thread blocks and the GPU sits idle.
+
+V1 was faster because `AllModalityDatasetWithMultithreading` ran tokenization in `num_actors=8` parallel threads. The main thread only did packing from a prefetched queue.
+
+### Fix: Prefetch Thread (2026-04-09)
+
+Commit: `[omni] Add prefetch thread to T2A bridge dataset for stable step_time`
+
+Moved the entire tokenize+pack pipeline into a background daemon thread (`t2a-bridge-prefetch`) that feeds packed batches into a `queue.Queue(maxsize=8)`. The main training thread just does `queue.get()`.
+
+```
+Before:  Main thread: [S3 wait] → [tokenize] → [pack] → [GPU forward] → repeat
+After:   Prefetch:    [S3 wait] → [tokenize] → [pack] → queue.put()
+         Main thread: queue.get() → [GPU forward] → queue.get() → ...
+```
+
+Key implementation details:
+
+- `prefetch_queue_size=8` packed batches buffered ahead (configurable)
+- Processors instantiated inside the thread via `_build_processors()` (not shared with main thread)
+- `stop_event` + queue drain for clean shutdown
+- Sentinel `None` value signals worker completion/crash
+- Worker is a daemon thread — dies automatically if main process exits
+
+Expected improvement: step_time should stabilize to ~7-10s (matching V1) without the memory leak.
+
 ---
 
 ## Medium-Term Roadmap
@@ -1719,9 +1760,121 @@ This requires the understanding stream to handle **interleaved text + audio inpu
 
 ---
 
+## Git Branch Structure
+
+| Branch | Purpose | Status |
+|--------|---------|--------|
+| `dongguo/omni-t2a` | V1 data loader (AllModalityDatasetWithMultithreading + GC workaround) | Pushed, OOMs after ~300 steps |
+| `dongguo/omni-t2a-v2` | Option B data loader (AudioBatchingDatasetV2 + bridge layer) | **Active**, running PoC |
+
+Both branches share the same model/trainer/loss code. Only the data loading layer differs.
+
+---
+
+## Merge Notes
+
+When merging `dongguo/omni-t2a-v2` to main, be aware:
+
+- **`lib/koba/koba/pipelines/default_t2a.py`** was deleted in main (PR #6718, "graveyard unused/dead code") but we kept it because our `OmniT2ADatasetConfig` (V1 path) imports from it. The Option B path (`OmniT2ABridgeDatasetConfig`) does NOT depend on this file. If using Option B only, this file can be safely dropped during merge.
+- **`lib/koba/koba/feeder/all_modality_dataset_with_multithreading.py`** — we removed `to_tensor_fn=None` (line 142) because `LanceDataset.Config` doesn't accept it. This fix benefits all V1 users.
+- **`lib/koba/koba/processor/audio_ops.py`** — added `list<binary>` unwrapping in `AudioDecoder` for whisperx datasets. This is a backward-compatible enhancement.
+
+---
+
+## Lessons Learned
+
+1. **Commit frequently**: A `git reset --hard HEAD` during cherry-pick conflict resolution wiped all uncommitted changes (~15 files across 2 days of work). Had to re-apply everything from conversation memory. Always commit before destructive git operations.
+
+2. **Lance `ds.take()` is NOT thread-safe**: Even with independent `lance.dataset()` handles per thread, concurrent `ds.take()` calls can panic in Rust. The Rust runtime may share process-level state. Use Lance through `AudioBatchingDatasetV2` (which manages threading internally) rather than calling `ds.take()` from your own ThreadPoolExecutor.
+
+3. **V1 `LanceDataset` SQL filters**: `filter=` raises `NotImplementedError`, `row_filter=` expects a Lance dataset path (not SQL). Use processor-level `RowFieldFilter` as a workaround, or use pre-filtered Lance tables.
+
+4. **`AudioBatchingDatasetV2` is the right abstraction for audio**: It handles threading, bucketing, memory management, and the V2 LanceReader — all battle-tested. Don't reinvent this; use it as a data source and bridge to your format.
+
+5. **HuggingFace model names change**: `Qwen/Qwen3-2B` now points to Qwen3.5 (MoE, model type `qwen3_5`), not the dense Qwen3-2B. The omni team uses pre-converted checkpoints (`osc://sam/qwen_3_single_weights_{size}.pt`) which are pinned to specific architectures.
+
+---
+
+## Launch Scripts
+
+### Previous PoC Runs (on this node)
+
+All runs launched from `/fsx/dongguo/Projects/lumaverse/projects/kuma` with `.venv` activated.
+
+**V1 data loader run** (`dongguo/omni-t2a` branch) — OOM'd at ~300 steps:
+
+```bash
+cd /fsx/dongguo/Projects/lumaverse/projects/kuma
+source .venv/bin/activate
+
+# Config: AllModalityDatasetWithMultithreading + internal-audio-v2-english
+torchrun --standalone --nproc_per_node 8 main.py \
+    --config kuma.projects.omni.bagel.configs.t2a.exp_0_6b_mmaudio_pretrained \
+    --name omni_t2a_0_6b_pretrained
+```
+
+W&B: https://wandb.ai/luma-ai/omni-t2a/runs/g0ebocom
+
+**Option B data loader run** (`dongguo/omni-t2a-v2` branch) — no OOM, but step_time spikes:
+
+```bash
+cd /fsx/dongguo/Projects/lumaverse/projects/kuma
+source .venv/bin/activate
+
+# Config: AudioBatchingDatasetV2 + OmniT2ABridgeDataset (no prefetch thread)
+# Dataset: emilia + internal-audio-v1
+torchrun --standalone --nproc_per_node 8 main.py \
+    --config kuma.projects.omni.bagel.configs.t2a.exp_0_6b_mmaudio_pretrained_v2 \
+    --name omni_t2a_0_6b_pretrained_v2
+```
+
+W&B: https://wandb.ai/luma-ai/omni-t2a/runs/u27stj53
+
+### Proposed: Test Prefetch Fix (on another 8-GPU node)
+
+Branch `dongguo/omni-t2a-v2` now includes the prefetch thread fix. To verify step_time stabilizes:
+
+```bash
+# 1. Clone and set up on the new node
+cd /fsx/<username>/Projects
+git clone git@github.com:lumalabs/lumaverse.git  # or use existing clone
+cd lumaverse
+git checkout dongguo/omni-t2a-v2
+git pull origin dongguo/omni-t2a-v2
+
+# 2. Activate kuma venv (or create if not present)
+cd projects/kuma
+source .venv/bin/activate
+# If .venv doesn't exist: uv sync
+
+# 3. Source AWS credentials (required for S3 Lance datasets)
+source ~/.bashrc
+
+# 4. Launch the run — same config, now uses prefetch thread internally
+torchrun --standalone --nproc_per_node 8 main.py \
+    --config kuma.projects.omni.bagel.configs.t2a.exp_0_6b_mmaudio_pretrained_v2 \
+    --name omni_t2a_0_6b_pretrained_v2_prefetch
+```
+
+**What to verify on W&B:**
+
+- `train/step_time`: Should stabilize to ~7-10s without spikes (matching V1 run)
+- `train/step_time` variance: Should be low (no 20-80s outliers)
+- `train/loss`: Should decrease from ~1.7 toward ~1.4 over 300 steps
+- Process memory: Should remain stable (no growth over time)
+
+**If step_time is still spiking**, check whether the bottleneck shifted to `AudioBatchingDatasetV2`:
+
+- Increase `max_workers` in `AudioBatchingDatasetV2.Config` (default 2 → try 4)
+- Increase `prefetch_queue_size` in `OmniT2ABridgeDatasetConfig` (default 8 → try 16)
+
+---
+
 ## Next Steps
 
-- [ ] Run 2B overnight PoC training
+- [x] Monitor Option B overnight run for memory stability — **confirmed no OOM after 300+ steps**
+- [ ] Run Option B with prefetch thread fix — verify step_time stabilizes to ~7-10s
+- [ ] Run 2B model once dense Qwen3-2B checkpoint is available
 - [ ] Audio generation inference processor (T2A sampling loop)
 - [ ] A2T support — audio understanding encoder in understanding stream
 - [ ] CoT generation — combined CE + diffusion loss
