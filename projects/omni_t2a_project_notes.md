@@ -2524,3 +2524,56 @@ audio_config.max_workers = 4  # default is 2, try 4 or 8
 **If loss is NaN or diverges:**
 
 The padding strip may expose edge cases with very short clips (e.g., <0.5s → 1-2 audio tokens). Check if `max_per_seq_len` filtering is still working after the strip.
+
+---
+
+## Post-Mortem: Option B Run Crash at Step 1200 (2026-04-09)
+
+Diagnosing run: https://wandb.ai/luma-ai/omni-t2a/runs/u27stj53?nw=nwuserdongguo
+
+Run name: `omni_t2a_0_6b_pretrained_v2` (Option B, AudioBatchingDatasetV2 + bridge, no prefetch thread fix yet)
+Branch: `dongguo/omni-t2a-v2`
+Log file: `/tmp/omni_t2a_v2.log`
+
+### Grounded (from logs)
+
+- **Last successful step**: Step 1200 at `10:43:26`, diffusion_loss=0.629, num_samples=28
+- **Checkpoint saved**: Step 1200 checkpoint uploaded to S3 at `10:43:48`
+- **NCCL timeout**: At `11:08:32` (25 minutes after step 1200), the NCCL watchdog detected a collective timeout on all ranks
+- **Stuck operation**: `_ALLGATHER_BASE` (SeqNum=110609), the operation immediately after the last completed one (110608). Timeout threshold was 900s (15 min).
+- **No Python traceback**: Only C++ NCCL watchdog exceptions. FlightRecorder was disabled (`TORCH_NCCL_TRACE_BUFFER_SIZE` not set), so no stack trace of the stuck collective.
+- **All ranks killed**: SIGABRT on all 8 ranks (exitcode -6). NCCL takes down the entire process group when a timeout is detected.
+- **Earlier warning sign**: Step 1000→1100 had a 23-minute gap (`10:00:06` → `10:23:31`), but the run recovered from that stall.
+
+### Not known from logs
+
+- **Which rank was the straggler** — the timeout is reported by all ranks; the logs don't identify which rank failed to enter the collective
+- **What the straggler was doing** — could have been blocked in data loading, forward pass, backward pass, checkpoint I/O, or a GPU-level hang
+- **Whether the 23-min stall at step 1000 and the fatal hang at step 1200 share the same root cause**
+
+### Possible causes (inferred, not proven)
+
+1. **Data loader hang** — `AudioBatchingDatasetV2` or the prefetch thread blocked indefinitely on S3/Lance, preventing the rank from reaching the FSDP all-gather. Plausible because we observed frequent data_time spikes in this run, and the step 1000→1100 stall matches this pattern.
+2. **Prefetch thread deadlock** — The background thread could have hit an unhandled exception or a blocking `queue.put(timeout=60)` that silently stalled. The `try/except` in `_prefetch_worker` should catch this, but a GIL deadlock or Rust-level hang in Lance would bypass Python exception handling.
+3. **Silent GPU error** — A CUDA error on one rank could cause it to stop issuing NCCL operations. However, there are no CUDA error messages in the logs.
+4. **Checkpoint upload blocking training** — The HSDPCheckpointing worker uploads asynchronously, but if S3 upload stalled on one rank, it could potentially block the next training step. The logs show uploads completed at `10:43:48`, but only for ranks 2 and 3 — other ranks' upload status is not visible.
+5. **Network/infrastructure issue** — A transient NVLink or network failure on one GPU could cause it to hang on NCCL without any Python-level error.
+
+### Assessment: likely data loading related
+
+Evidence pointing toward data loading:
+
+1. **The 23-min stall at step 1000→1100 recovered** — this matches a long data stall (eventually got data, resumed), not a GPU error (which wouldn't self-recover)
+2. **The data_time spike pattern throughout the run** — we already confirmed AudioBatchingDatasetV2 periodically stalls for 15-20s; a longer stall (>15 min) would exceed the NCCL timeout
+3. **No CUDA errors in the logs** — rules out GPU hardware failure
+4. **`_ALLGATHER_BASE` is an FSDP unshard** — this happens at the start of each forward pass, right after `next(dataloader)` returns. If one rank is stuck waiting for data, the other ranks wait at this all-gather.
+
+What makes it less than certain: the stall happened 25 minutes after step 1200, and we don't have per-rank logs showing the prefetch thread was the one blocked. A Lance Rust-level deadlock (not just slow S3) would look identical from the outside.
+
+**Bottom line**: Data loading is the most likely cause, but the prefetch thread + padding strip fix may not be sufficient if the underlying issue is Lance/S3 hanging indefinitely rather than just being slow. For the next run, adding a watchdog log in the prefetch thread (e.g., log every 60s if no batch produced) would confirm or rule this out quickly.
+
+### What would help diagnose in future runs
+
+- `TORCH_NCCL_TRACE_BUFFER_SIZE=1000` — enables FlightRecorder, captures stack traces at the point of the stuck collective
+- Per-rank logging in the prefetch thread (e.g., log every N batches to confirm the thread is alive)
+- `dmesg` or kernel logs from the node (GPU Xid errors, OOM kills)
