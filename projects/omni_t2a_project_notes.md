@@ -2352,7 +2352,7 @@ torchrun --standalone --nproc_per_node 8 main.py \
 ## Next Steps
 
 - [x] Monitor Option B overnight run for memory stability — **confirmed no OOM after 300+ steps**
-- [ ] Strip duration padding in bridge — recover V1-level compute efficiency (~5s/step)
+- [x] Strip duration padding in bridge — recover V1-level compute efficiency (~5s/step)
 - [ ] Run Option B with prefetch thread + padding fix — verify step_time drops to ~7s
 - [ ] Run 2B model once dense Qwen3-2B checkpoint is available
 - [ ] Audio generation inference processor (T2A sampling loop)
@@ -2362,3 +2362,115 @@ torchrun --standalone --nproc_per_node 8 main.py \
 - [ ] Sequence parallelism (Ulysses) for longer sequences
 - [ ] Multi-node Flyte launch config
 - [ ] Evaluation metrics (FAD, CLAP score)
+
+---
+
+## Test Script: Prefetch + Padding Strip Fix (2026-04-09)
+
+Run on a fresh 8-GPU node to validate three fixes applied in `dongguo/omni-t2a-v2`:
+
+1. **Prefetch thread** — tokenize+pack in background thread (eliminates data_time spikes)
+2. **Padding strip** — truncate to `original_durations` before tokenization (eliminates 2.6x compute overhead)
+3. **Sample rate from config** — `audio_sample_rate` read from `AudioBatchingDatasetV2.Config` (correct for both MMAudio 16kHz and DAC VAE 48kHz)
+
+Key commits:
+
+```
+99a3379b88 [omni] Read audio_sample_rate from AudioBatchingDatasetV2 config
+196c9c0b50 [omni] Strip bucket padding in T2A bridge before tokenization
+6a93771617 [omni] Add prefetch thread to T2A bridge dataset for stable step_time
+```
+
+### Setup and Launch
+
+```bash
+#!/bin/bash
+# ============================================================
+# Omni T2A PoC — Option B with prefetch + padding strip fix
+# Run on an 8-GPU node (A100 80GB)
+# Branch: dongguo/omni-t2a-v2
+# ============================================================
+
+set -euo pipefail
+
+# 1. Navigate to repo (assumes lumaverse is already cloned at /fsx/<user>/Projects/)
+cd /fsx/dongguo/Projects/lumaverse
+
+# 2. Fetch latest and switch to the branch
+git fetch origin dongguo/omni-t2a-v2
+git checkout dongguo/omni-t2a-v2
+git pull origin dongguo/omni-t2a-v2
+
+# 3. Activate kuma venv
+cd projects/kuma
+source .venv/bin/activate
+
+# 4. Source AWS credentials (required for S3 Lance datasets)
+source ~/.bashrc
+
+# 5. Launch 8-GPU training
+#    - Config: exp_0_6b_mmaudio_pretrained_v2
+#      (AudioBatchingDatasetV2 + bridge with prefetch + padding strip)
+#    - Run name includes "v3" to distinguish from previous runs
+nohup torchrun --standalone --nproc_per_node 8 main.py \
+    --config kuma.projects.omni.bagel.configs.t2a.exp_0_6b_mmaudio_pretrained_v2 \
+    --name omni_t2a_0_6b_pretrained_v3 \
+    > /tmp/omni_t2a_v3.log 2>&1 &
+
+echo "PID: $!"
+echo "Monitor logs: tail -f /tmp/omni_t2a_v3.log"
+echo "W&B project: https://wandb.ai/luma-ai/omni-t2a"
+```
+
+### What to Verify on W&B
+
+Compare against previous runs:
+
+- V1: https://wandb.ai/luma-ai/omni-t2a/runs/g0ebocom (`omni_t2a_0_6b_pretrained`)
+- V2 no prefetch: https://wandb.ai/luma-ai/omni-t2a/runs/u27stj53 (`omni_t2a_0_6b_pretrained_v2`)
+- V3 (this run): `omni_t2a_0_6b_pretrained_v3`
+
+**Expected metrics at ~step 100+ (after torch.compile warmup):**
+
+| Metric | V1 (target) | V2 (before fix) | V3 (expected) |
+|--------|-------------|-----------------|---------------|
+| `train/step_time` | ~7.5s, stable | ~13s, spiky (20-80s outliers) | **~7s, stable** |
+| `train/data_time` | ~2.5s, steady | ~0s with 15-20s spikes | **~0s, rare small spikes** |
+| `train/num_samples` | ~30 | ~22 | **~35-40** (more real clips per pack) |
+| `train/loss` at step 300 | ~1.35 | ~1.5 | **~1.3** (cleaner latents + more samples) |
+| Process memory | OOM at ~300 steps | Stable | **Stable** |
+
+**Key things to watch:**
+
+1. **`train/step_time` stability** — Should be flat ~7s with no large spikes. If spikes remain, the bottleneck is in `AudioBatchingDatasetV2` (try increasing `max_workers`).
+
+2. **`train/num_samples`** — Should increase from V2's ~22 to ~35-40. This confirms padding is stripped and the token budget is used for real audio.
+
+3. **`train/loss` convergence rate** — Should track closer to V1's curve (faster decrease), because each step now trains on more real audio clips with clean (uncorrupted) latents.
+
+4. **Process memory** — Should remain stable (no growth). The padding strip does not affect memory stability since `AudioBatchingDatasetV2`'s V2 LanceReader still handles the leak fix.
+
+### Troubleshooting
+
+**If `num_samples` is still ~22 (not increasing):**
+
+The padding strip may not be active. Check that `original_durations` is present in the flat batch:
+
+```bash
+# Add temporary debug logging in omni_t2a_bridge_dataset.py:
+# In _prefetch_worker(), after getting original_durations:
+#   loguru.info(f"original_durations: {original_durations}")
+```
+
+**If step_time is still spiking (>15s outliers):**
+
+The `AudioBatchingDatasetV2` internal queues may be draining. Try:
+
+```python
+# In t2a.py exp_0_6b_mmaudio_pretrained_v2():
+audio_config.max_workers = 4  # default is 2, try 4 or 8
+```
+
+**If loss is NaN or diverges:**
+
+The padding strip may expose edge cases with very short clips (e.g., <0.5s → 1-2 audio tokens). Check if `max_per_seq_len` filtering is still working after the strip.
