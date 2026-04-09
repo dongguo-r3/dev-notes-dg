@@ -1736,6 +1736,485 @@ Key implementation details:
 
 Expected improvement: step_time should stabilize to ~7-10s (matching V1) without the memory leak.
 
+### Efficiency Deep Dive: Why Option B Compute Time is 2.6x Slower (2026-04-09)
+
+After adding the prefetch thread and comparing all three runs on W&B (`train/data_time`), an important observation emerged:
+
+**data_time comparison:**
+
+| Run | Baseline data_time | Spikes |
+|-----|-------------------|--------|
+| V1 (orange, `omni_t2a_0_6b_pretrained`) | Consistent ~2-3s | None |
+| Option B no prefetch (green, `omni_t2a_0_6b_pretrained_v2`) | ~0s | Every ~20-30 steps, spikes to 15-20s |
+| Option B with prefetch (purple, `omni_t2a_0_6b_pretrained_v2_prefetch`) | ~0s | Less frequent, but still present |
+
+**Paradox**: Option B has much lower data_time most of the time, yet step_time is nearly 2x higher. Where does the extra time go?
+
+**Decomposing step_time:**
+
+```
+step_time = data_time + compute_time
+
+V1:       step_time ~7.5s = data_time ~2.5s + compute ~5.0s
+Option B: step_time ~13s  = data_time ~0s   + compute ~13.0s
+```
+
+The GPU is doing **2.6x more compute** per step in Option B. Same model, same `max_num_tokens=8000`. The cause: **duration bucket zero-padding**.
+
+#### Root Cause: AudioBatchingDatasetV2 Pads Audio to Bucket Ceilings
+
+`AudioBatchingDatasetV2` uses duration bucketing for uniform batch shapes. Every clip is zero-padded to its bucket ceiling:
+
+```
+Config: duration_buckets = [5.04, 7.54, 10.04, 12.54, 15.04] seconds
+        probabilities = [0.2, 0.2, 0.2, 0.2, 0.2] (equal)
+        compression_factor = 512, sample_rate = 16kHz
+```
+
+A 3-second clip assigned to the 5.04s bucket gets 2s of zero-padding appended. The bridge then passes the **padded** waveform to the tokenization pipeline. `OmniElementAudio` computes `num_tokens = ceil(padded_frames / compression_factor)`, inflating the token count.
+
+#### Token Inflation Math
+
+| Bucket | Padded frames | Audio tokens | + ~50 text tokens | Sample total |
+|--------|--------------|-------------|-------------------|-------------|
+| 5.04s  | 80,640       | 158         | ~50               | ~208        |
+| 7.54s  | 120,640      | 236         | ~50               | ~286        |
+| 10.04s | 160,640      | 314         | ~50               | ~364        |
+| 12.54s | 200,640      | 392         | ~50               | ~442        |
+| 15.04s | 240,640      | 470         | ~50               | ~520        |
+
+**Average sample size** (equal bucket probability): ~364 tokens → **~22 samples per 8000-token pack**
+
+**V1 comparison** (internal-audio-v2-english, no padding, whisperx segments ~3-8s):
+Average ~5s clip → 156 audio tokens + 50 text → ~206 tokens → **~39 samples per 8000-token pack**
+
+#### Impact on Compute
+
+Both V1 and Option B packs have 8000 tokens → FlexAttention compute is identical. The extra cost comes from two sources:
+
+**1. MMAudio encoder processes padded waveforms.** The trainer calls `audio_encoder(x_audio)` where `x_audio` is the raw waveform concatenated from all samples in the pack. In Option B, this includes all zero-padded regions:
+
+- Option B: 22 samples × avg 10.04s × 16kHz = **~3.5M frames** (includes silence padding)
+- V1: 39 samples × avg 5s × 16kHz = **~3.1M frames** (all real audio)
+
+**2. More critically: padding consumes the token budget.** With 8000 tokens per pack, zero-padded audio tokens crowd out real samples. Option B fits ~22 real clips per step vs V1's ~39. Each gradient step updates on **44% fewer real audio clips**, which:
+
+- Makes each step less sample-efficient (fewer real gradients per update)
+- Explains why Option B's loss decreases slower (1.7→1.5 vs V1's 1.7→1.35 at step 300)
+- Means more steps needed to reach the same loss → worse wall-clock efficiency
+
+**3. Dataset difference also contributes.** V1 uses `internal-audio-v2-english` (whisperx segments, mostly 3-8s), while Option B uses `emilia + internal-audio-v1` (broader duration distribution). Longer clips inflate the average token count further.
+
+#### Fixing the Efficiency Gap
+
+**Option A: Strip padding in the bridge** — use `original_durations` from the flat batch to truncate padded audio back to actual length before passing to `OmniElementAudio`. This preserves bucketed batching (AudioBatchingDatasetV2 benefit) while eliminating token waste:
+
+```python
+# In OmniT2ABridgeDataset._prefetch_worker():
+original_durations = flat_batch.get("original_durations")
+for i in range(batch_size):
+    sample_audio = audio_tensor[i]
+    # Truncate padding: use original duration, not bucket ceiling
+    if original_durations:
+        orig_frames = int(original_durations[i] * 16000)
+        sample_audio = sample_audio[:orig_frames]
+```
+
+Expected result: token budget used for real audio only → ~39 samples/pack (matching V1) → compute per step drops from ~13s to ~5s.
+
+**Option B: Use the same dataset as V1** — switch to `internal-audio-v2-english` (shorter clips, less padding waste). Combined with padding stripping, this maximizes samples per pack.
+
+**Option C: Tune bucket sizes** — use narrower buckets (e.g., [3, 5, 7, 9, 11]s) to reduce max padding per clip, at the cost of more bucket queues.
+
+#### Summary
+
+| Factor | V1 | Option B | Impact |
+|--------|-----|----------|--------|
+| Duration padding | None (variable-length) | Padded to bucket ceiling | ~1.8x token inflation |
+| Avg sample size | ~206 tokens | ~364 tokens | 44% fewer clips per pack |
+| MMAudio encoder frames | ~3.1M/step | ~3.5M/step | ~13% more encoder work |
+| Real clips per step | ~39 | ~22 | Slower loss convergence |
+| data_time | ~2.5s (steady) | ~0s (with spikes) | Lower baseline, but spiky |
+| compute_time | ~5.0s | ~13.0s | **2.6x more** |
+
+The key insight: **lower data_time does not mean faster training**. The padding overhead shifted the bottleneck from data loading to GPU compute. The priority fix is stripping duration padding in the bridge, which should recover V1-level compute efficiency while keeping Option B's memory stability.
+
+### Task Formulation: Padding, Loss Masking, and Non-Causal Encoders (2026-04-09)
+
+The efficiency gap above is a symptom of a deeper task formulation issue. The question: given a text transcript, the target audio has **variable duration** (same sentence can be spoken in 1.5s or 4s). How we handle this variance changes what the model learns.
+
+#### How Ray3 T2A Handles Variable-Length Audio (Reference)
+
+Ray3 uses a careful three-part approach (see `ray3_t2av/trainer.py` and `ray3_t2av/loss/diffusion_loss.py`):
+
+1. **Sequential encoding**: MMAudio is a non-causal encoder — padding zeros corrupt ALL latent positions, not just the padded ones. Ray3 encodes each sample **individually at its true length**, then pads the resulting latents and stacks into a batch. This preserves latent fidelity.
+
+2. **Per-sample length tracking**: `audio_lengths` is threaded through the pipeline alongside the audio tensor. After encoding, `latent_lengths` is computed and passed to the loss.
+
+3. **Masked diffusion loss**: `_create_temporal_mask(lengths, shape)` creates a binary mask (1.0 for real, 0.0 for padding). Loss is computed as a masked mean — only real audio regions contribute to gradients:
+
+   ```python
+   # Ray3: loss/diffusion_loss.py
+   if modality == "aud" and aud_lengths_cond is not None:
+       temporal_mask = _create_temporal_mask(aud_lengths_cond, diff_loss.shape)
+       diff_loss = _masked_mean(diff_loss, temporal_mask)
+   ```
+
+#### How Our Omni T2A Currently Handles It (Problems)
+
+Our pipeline has three compounding issues:
+
+**Problem 1: Non-causal encoder sees padded input.** `AudioBatchingDatasetV2` pads clips to bucket ceilings. The bridge passes padded waveforms directly to MMAudio encoder. Because MMAudio is non-causal (convolution-based), the zero-padded suffix contaminates **all** latent positions — not just the padding positions. This means even the "real" speech latents are corrupted.
+
+```
+Actual audio:  [speech speech speech 0 0 0 0 0]  (padded to bucket)
+                          ↓ MMAudio (non-causal)
+Latents:       [corrupt corrupt corrupt silence]   ← ALL positions affected
+```
+
+**Problem 2: No loss masking.** Our loss (`bagel_t2a.py` line 157-158) computes:
+
+```python
+diffusion_loss = nn.functional.mse_loss(prediction, target, reduction="mean")
+```
+
+MSE is averaged over **all** positions including silence padding. Consequences:
+
+- **Diluted loss signal**: The model gets "free" loss reduction from trivially predicting near-zero silence latents. At step 300, the reported loss of 1.5 may be lower than actual speech quality warrants because silence predictions are easy.
+- **Gradient pollution**: Gradients from silence regions push the model toward low-energy outputs, potentially suppressing dynamic range and expressiveness in real speech.
+- **Incorrect weighting**: A 3s clip in a 15s bucket contributes 80% silence loss and 20% speech loss. The model optimizes for silence more than speech.
+
+**Problem 3: No duration signal.** The model receives text tokens + audio tokens but has no way to know the intended audio duration. In the packed sequence `[TEXT AUDIO]`, the audio region is fixed per bucket, not per utterance. The model cannot learn "this sentence should be spoken in 2s vs 5s" because that information is lost in the padding.
+
+#### Comparison Table
+
+| Aspect | Ray3 T2A | Our Omni T2A (current) |
+|--------|----------|----------------------|
+| Audio encoding | Per-sample at true length | Batched with padding (non-causal corruption) |
+| Latent quality | Clean (no padding artifacts) | Corrupted (padding bleeds into real positions) |
+| Loss masking | `_masked_mean()` on real positions only | `mse_loss(reduction="mean")` over all positions |
+| Duration signal | Implicit in latent length | Lost in bucket padding |
+| Silence gradients | Zero (masked out) | Non-zero (learning to predict silence) |
+
+#### Why This Matters Beyond Efficiency
+
+This isn't just about wasting compute on silence. It affects model quality:
+
+1. **Audio fidelity**: Non-causal encoder corruption means the model is trained on degraded latents. Even if it learns a perfect denoiser, the targets themselves are wrong.
+
+2. **Speaking rate**: Without a duration signal, the model may learn the average rate across all bucket paddings rather than the natural rate of each utterance. This could produce monotonic, unnatural speech.
+
+3. **Loss interpretation**: The reported `diffusion_loss` is not comparable between V1 and V2 runs because V2's loss includes trivially-easy silence predictions. A loss of 1.5 in V2 could correspond to worse real speech quality than a loss of 1.5 in V1.
+
+#### Recommended Fixes (Priority Order)
+
+**Fix 1 (Critical): Strip padding before encoding.**
+
+In the bridge, use `original_durations` from the flat batch to truncate audio before passing to the omni tokenization pipeline:
+
+```python
+# In OmniT2ABridgeDataset._prefetch_worker():
+original_durations = flat_batch.get("original_durations")
+for i in range(batch_size):
+    sample_audio = audio_tensor[i]
+    if original_durations:
+        orig_frames = int(original_durations[i] * 16000)
+        sample_audio = sample_audio[:orig_frames]
+```
+
+This solves both the efficiency problem (more real samples per pack) and the encoder corruption problem (MMAudio sees only real audio).
+
+**Fix 2 (Important): Add loss masking.**
+
+If variable-length audio is ever packed (not just concatenated), add temporal masking to `BagelT2ALoss`:
+
+```python
+# Compute per-token loss mask from vae_token_mask + original lengths
+# Only score positions corresponding to real audio
+diff_loss = masked_mean(diff_loss, audio_valid_mask)
+```
+
+Note: If Fix 1 is applied (no padding at encoding time), loss masking becomes less critical because all audio tokens correspond to real content. But it remains good practice for robustness.
+
+**Fix 3 (Future): Duration conditioning.**
+
+For TTS quality, the model should eventually receive a duration signal (e.g., target duration in seconds as a conditioning token, or a separate duration predictor like FastSpeech 2). This lets the model learn speaking rate variation rather than averaging it out.
+
+#### Concrete Walkthrough: Two Processing Settings with Synthetic Examples
+
+To make the above analysis precise, here is a step-by-step comparison using three synthetic audio samples.
+
+**Setup:** Three samples, all with transcript "Hello world":
+
+| Sample | Actual duration | Actual frames (16kHz) | Bucket (Option B) | Padded frames |
+|--------|----------------|----------------------|-------------------|---------------|
+| A | 2.0s | 32,000 | 5.04s | 80,640 |
+| B | 4.5s | 72,000 | 5.04s | 80,640 |
+| C | 6.0s | 96,000 | 7.54s | 120,640 |
+
+MMAudio 16k encoder: `compression_factor=512`, `latent_dim=20`.
+
+##### Setting 1: Ray3 (Sequential Encoding, Masked Loss)
+
+**Step 1: Encode each sample individually at its true length.**
+
+MMAudio is a convolutional encoder with non-causal (bidirectional) convolutions. The encoder "sees" the entire input when computing any output position.
+
+```
+Sample A: waveform [32,000 frames] → MMAudio → latents [20, 63]   (63 = ceil(32000/512))
+Sample B: waveform [72,000 frames] → MMAudio → latents [20, 141]  (141 = ceil(72000/512))
+Sample C: waveform [96,000 frames] → MMAudio → latents [20, 188]  (188 = ceil(96000/512))
+```
+
+Each encoding is clean — the encoder only sees real speech waveform. No zero-padding enters the convolution receptive fields.
+
+**Step 2: Pad latents to max length in batch, track lengths.**
+
+```
+Max latent length in batch = 188 (Sample C)
+
+Sample A latents: [20, 63]  → pad → [20, 188]   latent_length = 63
+Sample B latents: [20, 141] → pad → [20, 188]   latent_length = 141
+Sample C latents: [20, 188] → no pad             latent_length = 188
+
+Stacked: z0 = [3, 20, 188]
+lengths = [63, 141, 188]
+```
+
+Note: padding happens **after** encoding — the zeros are in latent space, never seen by the encoder.
+
+**Step 3: Diffusion forward (noise + denoise).**
+
+```
+eps = randn([3, 20, 188])        # noise
+zt = alpha * z0 + sigma * eps     # noisy latents
+prediction = model(zt, sigma, text_conditioning)  # denoiser output
+
+raw_loss = (prediction - target)^2   # shape [3, 20, 188], per-element MSE
+```
+
+**Step 4: Masked loss — only real positions contribute.**
+
+```
+temporal_mask from lengths:
+  Sample A: [1,1,...,1, 0,0,...,0]   63 ones, 125 zeros
+  Sample B: [1,1,...,1, 0,0,...,0]   141 ones, 47 zeros
+  Sample C: [1,1,...,1,1,1,1,1,1]   188 ones, 0 zeros
+
+Shape: [3, 1, 188] (broadcast over channel dim)
+
+Per-sample loss:
+  loss_A = sum(raw_loss[0] * mask[0]) / (63 * 20)    ← only 63 real positions
+  loss_B = sum(raw_loss[1] * mask[1]) / (141 * 20)   ← only 141 real positions
+  loss_C = sum(raw_loss[2] * mask[2]) / (188 * 20)   ← all 188 real positions
+
+final_loss = (loss_A + loss_B + loss_C) / 3   ← each SAMPLE weighted equally
+```
+
+**Key properties:**
+
+- Each sample contributes equally regardless of duration
+- Silence regions produce zero gradient
+- 2s and 6s clips have equal influence on model update
+- Total real latent positions scored: 63 + 141 + 188 = **392**
+
+##### Setting 2: Our Omni T2A (Batch Encoding with Padding, Unmasked Loss)
+
+**Step 1: AudioBatchingDatasetV2 pads waveforms to bucket ceilings.**
+
+```
+Sample A: waveform [32,000] → pad to 5.04s → [80,640 frames]
+  Content: [speech speech ... speech 0 0 0 0 0 0 0 0 0 0 0 0]
+                   32,000 real          48,640 zeros
+
+Sample B: waveform [72,000] → pad to 5.04s → [80,640 frames]
+  Content: [speech speech ... speech 0 0 0 0 0]
+                   72,000 real      8,640 zeros
+
+Sample C: waveform [96,000] → pad to 7.54s → [120,640 frames]
+  Content: [speech speech ... speech 0 0 0 0 0 0 0 0]
+                   96,000 real          24,640 zeros
+```
+
+**Step 2: Bridge passes padded waveforms to omni tokenization.**
+
+`OmniElementAudio` computes token count from the **padded** length:
+
+```
+Sample A: num_tokens = ceil(80,640 / 512) = 158 tokens   (vs 63 real)
+Sample B: num_tokens = ceil(80,640 / 512) = 158 tokens   (vs 141 real)
+Sample C: num_tokens = ceil(120,640 / 512) = 236 tokens   (vs 188 real)
+```
+
+These token counts fill the `max_num_tokens=8000` packing budget.
+
+**Step 3: Trainer encodes the full padded waveform through MMAudio.**
+
+```
+                    ┌─────────────────────────────────────────────────────┐
+Sample A waveform:  │ speech speech speech | 0  0  0  0  0  0  0  0  0  │
+                    └─────────────────────────────────────────────────────┘
+                                        ↓
+                              MMAudio encoder (non-causal conv)
+                                        ↓
+                    ┌─────────────────────────────────────────────────────┐
+Sample A latents:   │  L1   L2   ...  L63 | L64  L65  ...  L158         │
+                    └─────────────────────────────────────────────────────┘
+                       ↑ corrupted ↑        ↑ silence-ish but also       ↑
+                       by trailing           corrupted by edge effects
+                       zeros in
+                       receptive field
+```
+
+**Why non-causal encoding corrupts everything:**
+
+MMAudio's encoder uses standard (non-causal) 1D convolutions. Each output position's receptive field extends both left and right. Consider latent position L60 (near the end of real speech in Sample A):
+
+```
+L60's receptive field (simplified, ~100 frames each side):
+
+    waveform:  ... [speech] [speech] [speech] [0] [0] [0] [0] ...
+                            ↑ L60 center ↑
+                    ←── receptive field ──→
+
+The convolution mixes real speech WITH trailing zeros.
+L60's value is different from what it would be without padding.
+```
+
+For Sample A (2s speech, 3s padding), even L1's receptive field may reach into the zero region if the encoder's total receptive field is large enough. The corruption is worst near boundaries but affects all positions to some degree.
+
+Compare: if Sample A were encoded at its true length (32,000 frames), L60 would only see real speech in its receptive field → clean latent.
+
+**Step 4: Trainer computes diffusion loss with NO masking.**
+
+```
+z0 shape per sample after encoding:
+  Sample A: [20, 158]   ← 63 positions from real speech, 95 from silence (all corrupted)
+  Sample B: [20, 158]   ← 141 real, 17 silence (all corrupted)
+  Sample C: [20, 236]   ← 188 real, 48 silence (all corrupted)
+```
+
+In the packed sequence format, these are concatenated:
+
+```
+packed audio tokens: [A's 158 tokens | B's 158 tokens | C's 236 tokens] = 552 tokens
+```
+
+Diffusion loss:
+
+```
+raw_loss = (prediction - target)^2   # shape [..., 552, 20]
+
+diffusion_loss = raw_loss.mean()     # mean over ALL 552 × 20 = 11,040 values
+                                     # no masking, no per-sample weighting
+```
+
+**What the loss "sees":**
+
+```
+Position breakdown of the 552 tokens:
+  Tokens 1-158   (Sample A): 63 corrupted-speech + 95 silence
+  Tokens 159-316 (Sample B): 141 corrupted-speech + 17 silence
+  Tokens 317-552 (Sample C): 188 corrupted-speech + 48 silence
+
+Real speech tokens:  63 + 141 + 188 = 392  (71%)
+Silence tokens:      95 + 17 + 48  = 160   (29%)
+
+But ALL tokens (including "real speech" ones) have corrupted latent values
+due to non-causal encoder seeing the padding.
+```
+
+**Gradient implications:**
+
+- 29% of gradient signal comes from learning to predict silence (trivially easy, near-zero latents)
+- Sample A (2s clip) contributes 158 tokens, Sample C (6s clip) contributes 236 tokens → **longer clips get more gradient weight**, not proportional to real content
+- Sample A is 60% silence by token count → the model mostly learns silence from this sample
+- The "speech" latents are corrupted targets — the model is learning to predict the **wrong** values
+
+##### Side-by-Side Summary
+
+```
+                    Setting 1 (Ray3)              Setting 2 (Our Omni T2A)
+                    ─────────────────             ───────────────────────────
+
+Waveform input      [32000]  (true length)        [80640]  (padded to bucket)
+to encoder          [72000]                       [80640]
+                    [96000]                       [120640]
+
+Encoder calls       3 separate calls              3 calls on padded waveforms
+                    (clean, no padding)           (non-causal: padding corrupts)
+
+Latent tokens       63 + 141 + 188 = 392         158 + 158 + 236 = 552
+scored in loss
+
+Silence tokens      0 (masked out)               160 (29% of loss)
+in loss
+
+Latent quality      Clean (encoder saw            Corrupted (encoder's
+                    only real speech)             receptive field mixed
+                                                  speech with zero-padding)
+
+Sample weighting    Equal (1/3 each)              By padded token count
+                                                  (Sample C gets 1.5x weight
+                                                  of Sample A)
+
+Effective tokens    392 real tokens               392 corrupted tokens
+for learning        (high quality gradients)      + 160 silence tokens
+                                                  (wasted + distorted gradients)
+
+Token budget used   392 / 8000 = 4.9%            552 / 8000 = 6.9%
+(for same 3 clips)  → room for ~57 more clips    → room for ~43 more clips
+```
+
+The fix is straightforward: in the bridge, truncate `audio_tensor[i]` to `original_durations[i]` **before** passing to the omni tokenization pipeline. This makes our pipeline behave like Setting 1 — encode real audio only, no padding waste, no encoder corruption.
+
+#### Audio Encoder Batching Strategy (2026-04-09)
+
+**Question**: After stripping bucket padding, `x_audio` is a list of variable-length waveforms. Should we encode them one-by-one (sequential) or batch them?
+
+**Current implementation** (`omni_t2a.py` lines 148-165):
+
+```python
+# Sequential: encode each sample individually at its true length
+for audio_tensor in x_audio:
+    audio_input = audio_tensor.unsqueeze(0)  # (1, L_i)
+    z0_i = self.audio_encoder(audio_input)   # (1, C, T_latent_i)
+    z0_list.append(z0_i)
+z0 = torch.cat(z0_list, dim=2)  # (1, C, total_T_latent)
+```
+
+This is the same approach as Ray3's `_encode_audio_sequential()` (`ray3_t2av/trainer.py` lines 602-642), which also encodes one sample at a time with true-length inputs to avoid non-causal corruption.
+
+**Is sequential encoding a bottleneck?**
+
+MMAudio 16k encoder is a lightweight CNN (~5M params, mel spectrogram + conv stack). Encoding cost per sample:
+
+```
+5s clip at 16kHz = 80,000 frames → ~1-2ms on A100
+Per training step: ~40 samples/pack × ~1.5ms ≈ 60ms total encoding
+28-layer transformer on 8000 tokens: ~5000ms
+
+Encoding is ~1% of step time — not a bottleneck.
+```
+
+**Batching options if encoder becomes heavier (future DAC VAE, larger models):**
+
+| Approach | Encode calls/step | Padding waste | Latent quality | When to use |
+|----------|-------------------|---------------|----------------|-------------|
+| **Sequential** (current) | N (~40) | 0 | Perfect | Default — correct and fast for lightweight encoders (MMAudio) |
+| **Pad to max-in-pack** | 1 | Bounded by max-min duration within pack | Slight corruption near sample boundaries | If encoder is heavy AND samples have similar lengths |
+| **Group by similar length** | 3-5 groups | Minimal per group | Near-perfect | Best tradeoff for heavy encoders with diverse durations |
+
+**Why pad-to-max-in-pack is reasonable after the padding strip fix:**
+
+After stripping bucket padding, all samples within a single pack fit the `max_num_tokens=8000` budget. With an average sample size of ~200 tokens (~6s audio), a pack holds ~40 samples. Their duration range is naturally bounded — the packer greedily fills, so the longest clip in a pack is at most `max_per_seq_len` and the shortest is whatever fits the remaining budget. Typical spread within a pack: ~3-8s, much smaller than the old bucket spread of 2-15s. This means pad-to-max-in-pack wastes at most ~5s of padding per sample, vs the old bucket design that could waste ~13s.
+
+**Decision**: Keep sequential encoding for now. MMAudio encoding is <1% of step time. Revisit if:
+
+- Switching to DAC VAE (heavier encoder, 128-dim latents)
+- Scaling to much larger batch sizes / longer sequences
+- Profiling shows `audio_encode` trace exceeding ~5% of step time
+
 ---
 
 ## Medium-Term Roadmap
@@ -1873,7 +2352,8 @@ torchrun --standalone --nproc_per_node 8 main.py \
 ## Next Steps
 
 - [x] Monitor Option B overnight run for memory stability — **confirmed no OOM after 300+ steps**
-- [ ] Run Option B with prefetch thread fix — verify step_time stabilizes to ~7-10s
+- [ ] Strip duration padding in bridge — recover V1-level compute efficiency (~5s/step)
+- [ ] Run Option B with prefetch thread + padding fix — verify step_time drops to ~7s
 - [ ] Run 2B model once dense Qwen3-2B checkpoint is available
 - [ ] Audio generation inference processor (T2A sampling loop)
 - [ ] A2T support — audio understanding encoder in understanding stream
