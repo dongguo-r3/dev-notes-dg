@@ -1736,6 +1736,56 @@ Key implementation details:
 
 Expected improvement: step_time should stabilize to ~7-10s (matching V1) without the memory leak.
 
+### Prefetch Run Results (2026-04-09)
+
+W&B: https://wandb.ai/luma-ai/omni-t2a/runs/3bhjps4k (`omni_t2a_0_6b_pretrained_v2_prefetch`)
+
+At ~290 steps, the prefetch thread fixed data loading but exposed a compute-side bottleneck:
+
+| Metric | V1 (g0ebocom) | Option B no prefetch (u27stj53) | Option B + prefetch (3bhjps4k) |
+|--------|---------------|--------------------------------|-------------------------------|
+| **data_time** | ~2.0s (steady) | ~0s baseline, spikes 15-20s every ~20-30 steps | **0.25s** (steady, no spikes) |
+| **Normal step_time** | 7-10s (stable) | 8-12s | 8-10s |
+| **Spike step_time** | none | 20-80s (irregular) | **~30s every ~3 steps** |
+| **Effective avg step_time** | ~7.3s | ~13s | **~15.9s** (dragged up by periodic spikes) |
+| **num_samples/rank** | 20-35, stable | 20-40 | 17-37 |
+| **loss @ 280 steps** | ~1.5 | ~1.5 | ~1.55 |
+| **grad_norm** | 2.0-3.0 | 2.0-3.0 | 2.2-2.8 |
+| **GPU memory** | 33GB (OOM at ~300) | 33GB (stable) | **33GB (stable)** |
+| **GPU utilization** | — | varied | 90-100% |
+
+**What the prefetch thread fixed**: data_time dropped from ~1.6s (with 15-20s spikes) to a steady 0.25s. The queue successfully decouples S3 I/O from GPU training.
+
+**What it did NOT fix**: ~30s step_time spikes occurring every ~3 steps. These do NOT correlate with num_samples changes (e.g., samples=19→19 still spikes at 30.2s), ruling out torch.compile recompilation from shape changes. The spikes are compute-side, likely from FlexAttention `create_block_mask` recomputation for each new packed layout, or periodic CUDA memory allocation overhead.
+
+### Padding Strip Bug Fix (2026-04-09)
+
+The initial padding strip commit (`196c9c0b50`) had a slicing bug: `sample_audio[:orig_frames]` truncated the **channel dimension** (dim 0) instead of the **time dimension** (dim -1) when audio was 2D `[channels, frames]`. Since channels=1, the slice was a no-op — padding was never actually stripped.
+
+Fix: `sample_audio[..., :orig_frames]` — ellipsis preserves all leading dims, slices only time.
+
+This explains why `num_samples` remained ~20-28/rank in runs `u27stj53`, `3bhjps4k`, and `28r7xpeu` despite the "strip" code being present.
+
+### V3 Run: Prefetch + Padding Fix + 10K Tokens (2026-04-09)
+
+W&B: https://wandb.ai/luma-ai/omni-t2a/runs/16gvru69 (`omni_t2a_0_6b_pretrained_v3`)
+
+Changes from previous runs:
+
+- Fixed padding strip bug (`[..., :orig_frames]`)
+- Increased `max_num_tokens` from 8000 → 10000 (~25% more, targeting ~47GB of 80GB)
+
+Early results (step 5-13, post torch.compile warmup):
+
+| Metric | V2 no-fix (u27stj53) | V3 broken strip (28r7xpeu) | **V3 fixed (16gvru69)** |
+|--------|---------------------|---------------------------|------------------------|
+| num_samples/rank | ~22 | ~22 | **28-50 (avg ~38)** |
+| loss @ step 10 | ~1.85 | ~1.90 | **~1.67** |
+| step_time (post warmup) | 8-12s + spikes | 8-10s + spikes | **~8s so far** |
+| GPU memory | 33GB | 31GB | **47GB** |
+
+The padding fix is confirmed working: `num_samples` nearly doubled (22 → 38 avg), meaning the token budget is now filled with real audio instead of silence padding. Lower initial loss (1.67 vs 1.90) reflects cleaner latents from unpadded MMAudio encoding.
+
 ### Efficiency Deep Dive: Why Option B Compute Time is 2.6x Slower (2026-04-09)
 
 After adding the prefetch thread and comparing all three runs on W&B (`train/data_time`), an important observation emerged:
@@ -2352,8 +2402,8 @@ torchrun --standalone --nproc_per_node 8 main.py \
 ## Next Steps
 
 - [x] Monitor Option B overnight run for memory stability — **confirmed no OOM after 300+ steps**
-- [x] Strip duration padding in bridge — recover V1-level compute efficiency (~5s/step)
-- [ ] Run Option B with prefetch thread + padding fix — verify step_time drops to ~7s
+- [x] Strip duration padding in bridge — fixed slicing bug (`[..., :orig_frames]`), num_samples 22→38
+- [x] Run Option B with prefetch thread + padding fix — **running as `16gvru69`, 47GB/GPU, ~8s/step, loss 1.67 @ step 10**
 - [ ] Run 2B model once dense Qwen3-2B checkpoint is available
 - [ ] Audio generation inference processor (T2A sampling loop)
 - [ ] A2T support — audio understanding encoder in understanding stream
