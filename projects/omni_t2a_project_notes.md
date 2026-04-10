@@ -2405,7 +2405,7 @@ torchrun --standalone --nproc_per_node 8 main.py \
 - [x] Strip duration padding in bridge — fixed slicing bug (`[..., :orig_frames]`), num_samples 22→38
 - [x] Run Option B with prefetch thread + padding fix — **running as `16gvru69`, 47GB/GPU, ~8s/step, loss 1.67 @ step 10**
 - [ ] Run 2B model once dense Qwen3-2B checkpoint is available
-- [ ] Audio generation inference processor (T2A sampling loop)
+- [x] Audio generation inference processor (T2A sampling loop) — implemented in `omni/bagel/inference/`
 - [ ] A2T support — audio understanding encoder in understanding stream
 - [ ] CoT generation — combined CE + diffusion loss
 - [ ] Multi-speaker / interleaved audio input
@@ -2577,3 +2577,387 @@ What makes it less than certain: the stall happened 25 minutes after step 1200, 
 - `TORCH_NCCL_TRACE_BUFFER_SIZE=1000` — enables FlightRecorder, captures stack traces at the point of the stuck collective
 - Per-rank logging in the prefetch thread (e.g., log every N batches to confirm the thread is alive)
 - `dmesg` or kernel logs from the node (GPU Xid errors, OOM kills)
+
+---
+
+## T2A Inference Implementation (2026-04-09)
+
+Implemented standalone T2A inference: text prompt → Euler denoising → MMAudio decode → .wav file.
+
+### Files Created / Modified
+
+| File | Purpose |
+|------|---------|
+| `omni/bagel/inference/processor/t2a_processor.py` | **NEW** — Inference processor: `get_sequence_plan_t2a()`, `tokenize_sequence_plan_t2a()` |
+| `omni/bagel/inference/processor/__init__.py` | **MODIFIED** — Registered `"t2a"` in both factory dicts |
+| `omni/bagel/inference/run_t2a_inference.py` | **NEW** — Standalone inference script with Euler sampler |
+| `omni/bagel/configs/t2a.py` | **MODIFIED** — Added `get_t2a_inference_params()` for centralized inference config |
+
+### Architecture
+
+```
+Text prompt
+  → get_sequence_plan_t2a()        [TEXT(prompt), AUDIO(placeholder)]
+  → tokenize_sequence_plan_t2a()   OmniElementAudio + OmniQwen3Tokenizer + MRoPE(THW)
+  → pack_sequence()                Packed batch dict (same format as training)
+  → euler_sample_t2a()             Euler denoising loop (rectified flow + sigma shift)
+  → PretrainedMMAudioDecoder       VAE decode (latents → mel) + BigVGAN vocoder (mel → waveform)
+  → torchaudio.save()              .wav file
+```
+
+### Inference Processor (`t2a_processor.py`)
+
+Follows the same pattern as `t2i_processor.py`:
+
+- `get_sequence_plan_t2a(text, duration_sec, sample_rate)` — Creates `[TEXT, AUDIO]` sequence elements. Audio element uses a dummy tensor sized to produce the correct token count via `OmniElementAudio`.
+- `tokenize_sequence_plan_t2a(plan, compression_factor)` — Tokenizes text (Qwen3) and audio (placeholder `<|image_pad|>` tokens with `noise` attention mode, `vae_token_mask=True`).
+- Uses `order="THW"` for MRoPE (1D temporal for audio), matching training.
+
+### Sigma Shift = Schedule Shift (no difference between Ray and Omni)
+
+The `BagelT2ALoss` training code applies a sigma shift as a post-hoc rescaling:
+
+```python
+sigma_shifted = (S * sigma) / (1 + (S - 1) * sigma)   # S = sigma_shift = 3.0
+```
+
+This looks different from `RectifiedFlowsSchedule(shift=...)` which adds a constant in logsnr space. But they are **exactly the same transformation**:
+
+```
+sigma_shifted / (1 - sigma_shifted)
+  = [S * sigma / (1 + (S-1)*sigma)] / [(1 - sigma) / (1 + (S-1)*sigma)]
+  = S * sigma / (1 - sigma)
+
+logit(sigma_shifted) = log(S) + logit(sigma)
+
+Since logsnr = -2 * logit(sigma):
+  logsnr_shifted = -2 * logit(sigma_shifted)
+                 = -2 * (log(S) + logit(sigma))
+                 = logsnr - 2*log(S)
+```
+
+So **`sigma_shift=S` in BagelT2ALoss is identical to `schedule.shift = -2*log(S)` in RectifiedFlowsSchedule**. For `S=3`: `shift = -2*log(3) ≈ -2.197`. This is the same parameterization Ray T2A uses (their configs use `-2*log(3)`, `-2*log(5)`, etc. depending on the training noise schedule).
+
+There is no fundamental difference in the sampler between Ray T2A and Omni T2A. The only difference is which shift value matches each model's training config. Both use the same diffusion infrastructure.
+
+### Sampler (`sample_t2a`)
+
+Uses the same diffusion infrastructure as Ray T2A (`ursa.models.omni.inference.diffusion`):
+
+- `RectifiedFlowsSchedule(shift=-2*log(3))` — matches training `sigma_shift=3.0`
+- `DDPM(eta=0)` — deterministic DDIM one-step function
+- `dm.sample_simple()` — standard sampling loop
+
+The model_fn wrapper (`make_t2a_model_fn`) adapts the omni MoT calling convention for `dm.sample_simple`:
+
+```python
+# dm.sample_simple calls: model_fn(x, logsnr, it, num_steps, logsnr_next)
+# Wrapper converts logsnr → sigma via NoiseCond, calls omni model, applies CFG
+noise_cond = NoiseCond()(logsnr)                           # logsnr → sigma
+xs = (x, text_ids)                                         # (audio_latents, text_token_ids)
+ts = (noise_cond, None)                                    # (sigma, None)
+(_, audio_out, *_), *_ = model(xs, ts, **batch_kwargs)     # velocity prediction
+# CFG: v = v_uncond + cfg * (v_cond - v_uncond)
+```
+
+### CFG Support
+
+When `--cfg > 0`, packs two samples into one batch:
+
+- Sample 0 (conditioned): `[text_prompt | audio_placeholder]`
+- Sample 1 (unconditioned): `[empty_text | audio_placeholder]`
+
+Both share the same initial noise. FlexAttention block mask isolates the samples. After model forward:
+
+```python
+v_cond   = audio_out[0:1]   # conditioned velocity
+v_uncond = audio_out[1:2]   # unconditioned velocity
+v_cfg    = v_uncond + cfg * (v_cond - v_uncond)
+```
+
+This is simpler than Ray T2A's separate `CFG` class because the omni model already handles multi-sample packing natively.
+
+### Model Calling Convention
+
+Matches training exactly — the model (`Qwen3MMDiT`) receives:
+
+- `xs = (audio_latents, text_ids)` where `audio_latents` is `(B, T, C)` (time-major) and `text_ids` is `batch["txt"][batch["text_token_mask"]]` (flat packed)
+- `ts = (noise_cond, None)` where `noise_cond` is `(B, 1)` sigma values
+- `**kwargs` = `position_ids, text_token_mask, vit_token_mask, vae_token_mask, sample_lens, split_lens, attn_modes, modulation_mask`
+
+The preprocessor (`Qwen3TextAudioPackedPreprocess`) handles embedding, RoPE, and attention mask construction. The postprocessor (`FinalVidLayerPacked`) projects audio hidden states back to latent dim.
+
+### Centralized Inference Config (`get_t2a_inference_params`)
+
+All inference-specific constants live in one place in `configs/t2a.py`:
+
+```python
+params = get_t2a_inference_params(model_size="0.6b", vae_mode="mmaudio_16k")
+# Returns:
+#   model_config: Qwen3MMDiT.Config (0.6B, 28 layers, hidden=1024)
+#   audio_latent_dim: 20
+#   hop_length: 512
+#   sample_rate: 16_000
+#   latent_scaling_factor: 1/2.3563
+#   schedule_shift: -2*log(3) ≈ -2.197 (same parameterization as Ray T2A)
+#   default_num_steps: 50
+#   default_cfg: 3.5
+#   default_eta: 0.0
+```
+
+### Comparison with Ray T2A Inference
+
+| Aspect | Ray T2A | Omni T2A | Different? |
+|--------|---------|----------|------------|
+| **Sampler infrastructure** | `dm.sample_simple()` + `DDPM(eta=0)` + `RectifiedFlowsSchedule` | **Same** | No |
+| **Schedule shift** | `-2*log(5)`, `-2*log(3)`, or `0` (per training config) | `-2*log(3)` (matches training `sigma_shift=3.0`) | No — same mechanism, value depends on training |
+| **Audio decoder** | `PretrainedMMAudioDecoder` | Same | No |
+| **Text conditioning** | UMT5-XXL cross-attention | Packed joint attention (frozen Qwen3) | Yes — architecture |
+| **CFG** | Separate `CFG` class, doubles batch externally | Packed samples (cond+uncond), split output | Yes — implementation, not math |
+| **Comparey** | `DashboardLogger` with `field_audio` | Not yet integrated | Yes — TODO |
+
+### Usage
+
+```bash
+cd projects/kuma && source .venv/bin/activate
+
+# Smoke test (random weights, no checkpoint)
+CUDA_VISIBLE_DEVICES=0 python kuma/projects/omni/bagel/inference/run_t2a_inference.py \
+    --prompt "A person speaking clearly in English" \
+    --duration 5.0 --num-steps 50 --output-dir ./t2a_output
+
+# With checkpoint + CFG
+CUDA_VISIBLE_DEVICES=0 python kuma/projects/omni/bagel/inference/run_t2a_inference.py \
+    --prompt "A person speaking clearly in English" \
+    --checkpoint-path osc://dongguo/omni_t2a_0_6b/step_01200.pt \
+    --duration 5.0 --num-steps 50 --cfg 3.5 --output-dir ./t2a_output
+
+# Skip audio decode (save latents only, faster for debugging)
+CUDA_VISIBLE_DEVICES=0 python kuma/projects/omni/bagel/inference/run_t2a_inference.py \
+    --prompt "Birds chirping in a forest" \
+    --skip-decode --output-dir ./t2a_output
+```
+
+### Future: Comparey Integration
+
+To post results to Comparey (like Ray T2A's `t2a_eval.py`), wrap the inference in an eval job with:
+
+```python
+dashboard_logger = DashboardLogger.Config()
+dashboard_logger.field_audio = "audio"
+dashboard_logger.field_audio_sample_rate = "sample_rate"
+dashboard_logger.slack_channel = "#omni-t2a-evals"
+```
+
+This requires converting `run_t2a_inference.py` into an `Inference` subclass that yields `{"audio": waveform, "sample_rate": 16000, "txt": prompt}` dicts. The `DashboardLogger` handles S3 upload, Comparey experiment creation, and Slack notifications.
+
+---
+
+## Formal Multi-Node Training (2026-04-10)
+
+### Goal
+
+Launch a proper multi-node training run on Flyte, matching the Ray T2A reference config (`luma-ai/t2a/runs/ovah4wwn`, `stage001_internal_audio_v2`) as closely as possible.
+
+### Reference Run
+
+W&B: `luma-ai/t2a/runs/ovah4wwn` (`ray3_t2a_mmaudio/stage001_internal_audio_v2`)
+PR: lumalabs/lumaverse#6888 (dataset config reorg, merged 2026-04-03)
+
+### Config: `exp_0_6b_mmaudio_formal`
+
+File: `omni/bagel/configs/t2a.py`
+
+All hyperparameters match the reference except model size and text conditioning:
+
+| Parameter | Reference (2.9B Ray3) | This run (0.6B Omni) |
+|-----------|----------------------|----------------------|
+| **Noise schedule** | `SampleLogSNRGeneric(shift=-1.6)`, truncated normal, scale=1.0 | Same |
+| **sigma_shift** | 3.0 | Same |
+| **Optimizer** | AdamW, lr=1e-4, wd=0.01, betas=(0.9, 0.95) | Same |
+| **LR warmup** | 5,000 steps | Same |
+| **CFG dropout** | 0.1 | Same |
+| **Dataset** | internal-audio-v2 | Same |
+| **Duration buckets** | [5.04, 10.04, 15.04] | Same |
+| **Peak normalize** | headroom=1.1, clamp=True | Same |
+| **Latent scaling** | 1/2.3563 (MMAudio 16k) | Same |
+| **Save every** | 5,000 | Same |
+| **max_num_tokens** | N/A (Ray uses fixed batch) | 10,000 |
+| **Model** | 2.9B Ray3 DiT, all trainable | 0.6B Omni MoT, ~300M trainable |
+| **Text conditioning** | UMT5-XXL cross-attention | Frozen Qwen3-0.6B packed attention |
+
+### Node Count Recommendation
+
+| | Reference (2.9B) | Ours (0.6B) |
+|---|---|---|
+| **Total params** | 2.9B | 0.6B (~5x smaller) |
+| **Trainable params** | 2.9B (all) | ~300M (audio stream only, text frozen) |
+| **GPUs** | 32 (4 nodes) | 16 (2 nodes) or 32 (4 nodes) |
+
+With only ~300M trainable params and `max_num_tokens=10000`, 2 nodes (16 GPUs) is sufficient. 4 nodes (32 GPUs) doubles batch size (more audio minutes per step), useful for comparing batch size scaling.
+
+### Launch Commands
+
+```bash
+cd /fsx/dongguo/Projects/lumaverse/projects/kuma
+source .venv/bin/activate
+flytecli activate --cluster kiwi-flyte
+
+# 2 nodes (16 GPUs) — baseline
+python flyte_main.py \
+    --config kuma.projects.omni.bagel.configs.t2a.exp_0_6b_mmaudio_formal \
+    --name omni_t2a/0_6b_formal_16gpu \
+    --nodes 2 \
+    --gpus-per-node 8 \
+    --wandb --influxdb --kuma-profiler \
+    --cluster kiwi-flyte \
+    --username_override dongguo
+
+# 4 nodes (32 GPUs) — 2x batch size
+python flyte_main.py \
+    --config kuma.projects.omni.bagel.configs.t2a.exp_0_6b_mmaudio_formal \
+    --name omni_t2a/0_6b_formal_32gpu \
+    --nodes 4 \
+    --gpus-per-node 8 \
+    --wandb --influxdb --kuma-profiler \
+    --cluster kiwi-flyte \
+    --username_override dongguo
+```
+
+Naming convention: `omni_t2a/0_6b_formal_{num_gpus}gpu` — encodes total GPU count so W&B runs and checkpoint paths don't collide. The 32gpu run has ~2x audio minutes per step; comparing loss curves at the same step count shows the effect of batch size scaling.
+
+### What to Monitor on W&B
+
+Project: `luma-ai/omni-t2a`
+
+| Metric | Expected (16gpu) | Expected (32gpu) |
+|--------|------------------|-------------------|
+| `train/step_time` | ~7-10s (stable after compile warmup) | ~7-10s (same, compute-bound) |
+| `train/loss` at step 5K | ~1.0-1.2 | ~0.9-1.1 (faster convergence from larger batch) |
+| `train/num_samples` | ~35-40 per rank | ~35-40 per rank (same per-GPU) |
+| Process memory | Stable ~30-50 GB/GPU | Same |
+| Audio minutes per step | ~56 min (16 GPUs × 3.5 min/GPU) | ~112 min (32 GPUs × 3.5 min/GPU) |
+
+---
+
+## Comparey Inference Evaluation
+
+### Context
+
+The Ray3 T2A team (inkyushin) already has a working eval pipeline that generates audio samples from checkpoints and uploads them to the **comparey dashboard** for side-by-side listening. Example experiment:
+
+- **Link:** `ki://ai-lumalabs-dashboard-samples-ap-se-2/dashboard_samples/by_id/69d8358fa54207dee464b612/`
+- **Experiment:** `ablation_wd_mmaudio_5s_eval_158-exp=ray3_t2a_mmaudio_ablation_wd`
+- **Checkpoint:** 155,000 (inkyushin's weight decay ablation)
+- **Contents:** 30 WAV files (~316 KB each, 5s duration, 16kHz) + `index.json` with prompts and generation times
+- **Prompts:** Diverse eval set — news, narration, announcements, poetry, emotional, technical — using `[SPEAKER_00]"..."` format
+
+### Goal
+
+Support the same comparey inference flow for omni T2A models with two modes:
+
+1. **During training** — automatically run inference with the latest checkpoint (continuous eval)
+2. **Post-hoc** — provide a list of already-trained checkpoints and run inference on all of them
+
+### Existing Infrastructure (Ray3 T2A pattern)
+
+Three layers in the Ray3 pipeline:
+
+| Layer | File | Role |
+|-------|------|------|
+| `InferJob` | `lib/ursa/ursa/infer_job.py` | Orchestrates checkpoint loading + eval loop |
+| `DashboardLogger` | `lib/ursa/ursa/infer_job.py:664` | Creates comparey experiments, uploads WAVs, posts to Slack |
+| `basic_t2a_eval_job()` | `projects/kuma/kuma/projects/ray3_t2av/inference/t2a_eval.py` | Config factory: wires training configs → InferJob + DashboardLogger |
+
+**`InferJob.run()` execution modes:**
+
+- `continuous_eval()` — polls for latest training checkpoint, runs eval when new one appears
+- `evaluate_specific_checkpoints()` — evaluates a given list of step numbers
+
+**`DashboardLogger` flow:**
+
+1. `initialize(step, name)` → creates `comparey.Experiment(exp_name, checkpoint=step)`
+2. `add(data)` → extracts audio from inference results, saves WAV, calls `comparey_exp.add_media_file()`
+3. `evaluate()` → returns metrics, logs dashboard URL
+
+**Dashboard URL format:** `https://internal-dashboard.sandbox.labs.lumalabs.ai/dashboards/compare-samples?exp1={slug}&cp1={step:05d}`
+
+### Problem
+
+`basic_t2a_eval_job()` is tightly coupled to the Ray3 architecture (`Ray3DenoiserForgeWrapper`, `T2ATask`, `GenerativeTaskInferencer`, Forge model managers). The omni T2A model uses a completely different pipeline (Qwen3MMDiT with packed self-attention, custom batch building via `t2a_processor.py`).
+
+### Design: Plug Omni T2A into InferJob
+
+Reuse the `InferJob` framework (gets continuous_eval, checkpoint_steps, DashboardLogger, Slack for free). Three new files needed:
+
+#### 1. `OmniT2AInferencer` — adapts omni inference to the InferJob protocol
+
+File: `projects/kuma/kuma/projects/omni/bagel/inference/t2a_inferencer.py`
+
+- Wraps existing functions from `run_t2a_inference.py`: `load_t2a_model()`, `load_audio_decoder()`, `build_t2a_batch()`, `sample_t2a()`
+- Implements inferencer protocol: `setup_models()`, `setup_datasets()`, `inference_step()`
+- `setup_models()` → builds Qwen3MMDiT + MMAudio decoder
+- `inference_step()` → for each prompt: build batch → sample → decode → return `{"audio": waveform, "sample_rate": sr, "txt": prompt, "total_time_taken": elapsed}`
+- Checkpoint loading via direct `load_state_dict()` (no Forge model manager)
+
+#### 2. `basic_omni_t2a_eval_job()` — config factory
+
+File: `projects/kuma/kuma/projects/omni/bagel/inference/t2a_eval.py`
+
+- Analogous to Ray3's `basic_t2a_eval_job()` but for omni
+- Creates `InferJob.Config` with DashboardLogger (audio field, Slack channel), OmniT2AInferencer, prompt dataset
+
+#### 3. Eval config functions — launchable via `flyte_main.py`
+
+File: `projects/kuma/kuma/projects/omni/bagel/configs/t2a_eval.py`
+
+```python
+def omni_t2a_mmaudio_5s_eval() -> InferJob.Config:
+    """Continuous eval — polls latest checkpoint during training."""
+    return basic_omni_t2a_eval_job(
+        model_config=qwen3_0_6B_t2a_mmaudio(),
+        duration_sec=5.0,
+        log_prefix="omni_t2a_mmaudio_5s_eval",
+    )
+
+def omni_t2a_mmaudio_5s_eval_steps() -> InferJob.Config:
+    """Evaluate specific checkpoints."""
+    job = omni_t2a_mmaudio_5s_eval()
+    job.checkpoint_steps = [50000, 100000, 150000, 200000]
+    return job
+```
+
+### Launch Commands
+
+```bash
+cd projects/kuma && source .venv/bin/activate
+flytecli activate --cluster kiwi-flyte
+
+# Mode 1: Continuous eval (polls latest checkpoint during training)
+python flyte_main.py \
+    --config kuma.projects.omni.bagel.configs.t2a_eval.omni_t2a_mmaudio_5s_eval \
+    --name dongguo/omni_t2a_experiment \
+    --username_override dongguo \
+    --nodes 1 --cluster kiwi-flyte
+
+# Mode 2: Evaluate specific checkpoints
+python flyte_main.py \
+    --config kuma.projects.omni.bagel.configs.t2a_eval.omni_t2a_mmaudio_5s_eval_steps \
+    --name dongguo/omni_t2a_experiment \
+    --username_override dongguo \
+    --nodes 1 --cluster kiwi-flyte
+```
+
+### Key Design Decisions
+
+| Decision | Choice | Why |
+|----------|--------|-----|
+| Framework | Reuse `InferJob` | Free continuous_eval, checkpoint_steps, DashboardLogger, Slack |
+| Model manager | Skip Forge, direct `load_state_dict` | Omni T2A doesn't use Forge's model manager pattern |
+| Prompt dataset | Reuse `PromptTxtDataset` | Same format as Ray3 T2A prompts, already works |
+| Batch size | 1 (sequential prompts) | Omni T2A packs CFG samples along T, not batch dim |
+
+### Open Questions
+
+- **Prompt set:** Reuse Ray3 T2A prompts (`[SPEAKER_00]"..."` format) or create new prompt format for omni T2A?
+- **Checkpoint path convention:** Are omni T2A checkpoints saved via Forge (standard `get_checkpoint_path` with username/name/step), or custom path?
