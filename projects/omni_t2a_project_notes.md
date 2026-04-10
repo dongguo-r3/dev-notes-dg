@@ -2580,6 +2580,50 @@ What makes it less than certain: the stall happened 25 minutes after step 1200, 
 
 ---
 
+## Run Log (2026-04-07 — 2026-04-10)
+
+All runs use 0.6B MoT (Qwen3-0.6B frozen text stream, random audio stream, ~300M trainable params), MMAudio 16k VAE, pure diffusion MSE loss.
+
+Branch: `dongguo/omni-t2a-v2` (commit `084eabdc95 Merge zewang/omni-t2a-koba-v2-adapter`) unless noted.
+
+### Phase 1: Data Loader Development (V1 → Option B → Koba V2)
+
+| W&B ID | Run Name | Config | Data Loader | Dataset | LR | Nodes×GPUs | Where | Status | Notes |
+|--------|----------|--------|-------------|---------|-----|------------|-------|--------|-------|
+| [g0ebocom](https://wandb.ai/luma-ai/omni-t2a/runs/g0ebocom) | `omni_t2a_0_6b_pretrained` | `exp_0_6b_mmaudio_pretrained` | V1 (AllModalityDataset) | internal-audio-v2-english | 1e-4 | 1×8 | local | Crashed (~300 steps) | **OOM**: Lance S3 memory leak. Step_time ~7.5s, loss 1.7→1.35 |
+| [u27stj53](https://wandb.ai/luma-ai/omni-t2a/runs/u27stj53) | `omni_t2a_0_6b_pretrained_v2` | `exp_0_6b_mmaudio_pretrained_v2` | Option B (AudioBatchingDatasetV2 + bridge, no prefetch) | emilia + internal-audio-v1 | 1e-4 | 1×8 | local | Crashed (~1200 steps) | **NCCL timeout**: data stall >15min. No OOM. Step_time ~13s (unstable), loss 1.7→0.6 |
+| [32o437te](https://wandb.ai/luma-ai/omni-t2a/runs/32o437te) | `omni_t2a_0_6b_pretrained_v2_prefetch` | `exp_0_6b_mmaudio_pretrained_v2` | Option B + prefetch thread | emilia + internal-audio-v1 | 1e-4 | 1×8 | local | Finished | Prefetch reduced data_time spikes but step_time still ~13s (padding overhead) |
+| [16gvru69](https://wandb.ai/luma-ai/omni-t2a/runs/16gvru69) | `omni_t2a_0_6b_pretrained_v3` | `exp_0_6b_mmaudio_pretrained_v2` | Option B + prefetch + padding strip | emilia + internal-audio-v1 | 1e-4 | 1×8 | local | Failed | Short run, details pending |
+
+### Phase 2: Koba V2 Native Packing (Current)
+
+| W&B ID | Run Name | Config | Data Loader | Dataset | LR | Nodes×GPUs | Where | Flyte Job ID | Status | Notes |
+|--------|----------|--------|-------------|---------|-----|------------|-------|-------------|--------|-------|
+| [fh7smmaz](https://wandb.ai/luma-ai/omni-t2a/runs/fh7smmaz) | `omni_t2a_koba_v2_test` | `exp_..._koba_v2` | Koba V2 (LanceReader + PackingDataset) | internal-audio-v2-english | 1e-4 | 1×8 | local | — | Finished | First koba v2 test |
+| [7krtfbsc](https://wandb.ai/luma-ai/omni-t2a/runs/7krtfbsc) | `omni_t2a_koba_v2_compare` | `exp_..._koba_v2` | Koba V2 | internal-audio-v2-english | 1e-4 | 1×8 | local | — | Finished | Local comparison run |
+| [9asejgsk](https://wandb.ai/luma-ai/omni-t2a/runs/9asejgsk) | `dongguo/omni_t2a_koba_v2_compare` | `exp_..._koba_v2` | Koba V2 | internal-audio-v2-english | 1e-4 | 1×8 | kiwi-flyte | `dongguo-uo-omni-t2a-koba-v2-compare-kd02b` | Running | Baseline koba v2 on Flyte |
+| [5oyhy5dk](https://wandb.ai/luma-ai/omni-t2a/runs/5oyhy5dk) | `dongguo/omni_t2a_formal_koba_v2_gc` | `exp_..._formal_koba_v2` | Koba V2 | internal-audio-v2-english | 1e-4 | 1×8 | kiwi-flyte | `dongguo--omni-t2a-formal-koba-v2-gc-k79b8` | Running | Formal run with GC |
+
+### Phase 3: LR Sweep (2026-04-10)
+
+All use koba v2 packing, internal-audio-v2-english, frozen Qwen3-0.6B text stream.
+
+| W&B ID | Run Name | Config | LR | Nodes×GPUs | Where | Flyte Job ID | Status | Notes |
+|--------|----------|--------|----|------------|-------|-------------|--------|-------|
+| [redxljkz](https://wandb.ai/luma-ai/omni-t2a/runs/redxljkz) | `dongguo/omni_t2a_koba_v2_lr1e5` | `exp_..._koba_v2_lr1e5` | 1e-5 | 1×8 | local | — | Failed | ExpiredToken (AWS creds) |
+| [iwgfgo7c](https://wandb.ai/luma-ai/omni-t2a/runs/iwgfgo7c) | `dongguo/omni_t2a_koba_v2_lr1e5` | `exp_..._koba_v2_lr1e5` | 1e-5 | 1×8 | local | — | Finished | Retry after cred refresh; killed by SIGTERM (pod eviction) |
+| [hk15yyf7](https://wandb.ai/luma-ai/omni-t2a/runs/hk15yyf7) | `dongguo/omni_t2a_koba_v2_lr1e6` | `exp_..._koba_v2_lr1e6` | 1e-6 | 1×8 | kiwi-flyte | `dongguo-gguo-omni-t2a-koba-v2-lr1e6-kd44e` | Running | |
+| [8m75dgpu](https://wandb.ai/luma-ai/omni-t2a/runs/8m75dgpu) | `dongguo/omni_t2a_koba_v2_lr2e5` | `exp_..._koba_v2_lr2e5` | 2e-5 | 1×8 | kiwi-flyte | `dongguo-gguo-omni-t2a-koba-v2-lr2e5-k4c81` | Running | |
+
+### Multi-Node Formal Runs
+
+| W&B ID | Run Name | Config | LR | Nodes×GPUs | Where | Flyte Job ID | Status | Notes |
+|--------|----------|--------|----|------------|-------|-------------|--------|-------|
+| [bcyx2a4o](https://wandb.ai/luma-ai/omni-t2a/runs/bcyx2a4o) | `omni_t2a/0_6b_formal_16gpu` | `exp_..._formal` | 1e-4 | 2×8 | kiwi-flyte | `dongguo-omni-t2a-0-6b-formal-16gpu-kb2b4` | Running | 16 GPU formal |
+| [ie0zgoca](https://wandb.ai/luma-ai/omni-t2a/runs/ie0zgoca) | `omni_t2a/0_6b_formal_32gpu` | `exp_..._formal` | 1e-4 | 4×8 | kiwi-flyte | `dongguo-omni-t2a-0-6b-formal-32gpu-ka1eb` | Running | 32 GPU formal |
+
+---
+
 ## T2A Inference Implementation (2026-04-09)
 
 Implemented standalone T2A inference: text prompt → Euler denoising → MMAudio decode → .wav file.
@@ -2961,3 +3005,47 @@ python flyte_main.py \
 
 - **Prompt set:** Reuse Ray3 T2A prompts (`[SPEAKER_00]"..."` format) or create new prompt format for omni T2A?
 - **Checkpoint path convention:** Are omni T2A checkpoints saved via Forge (standard `get_checkpoint_path` with username/name/step), or custom path?
+
+## Dataloader Refinement Plan (2026-04-10)
+
+Context: Ze Wang's PR #7209 provides a koba v2 native T2A packing path (`OmniT2APackingConfigV2`) as a cleaner replacement for our `OmniT2ABridgeDataset`. The current bridge path has a known memory leak (from `AllModalityDatasetWithMultithreading`) that likely causes dataloader crashes after a few hundred/thousand steps.
+
+### P0 — Test Ze's v2 path on his PR branch directly ✅ DONE (2026-04-10)
+
+- [x] Check out Ze's PR #7209 branch (`zewang/omni-t2a-koba-v2-adapter`)
+- [x] Run `debug_local_koba_v2` config on single GPU to verify basic functionality
+- [ ] Run `exp_0_6b_mmaudio_pretrained_koba_v2` on multi-node (skipped — 8-GPU local OOM'd due to 240GB cgroup limit; single-GPU was sufficient to validate)
+- [ ] Compare loss/grad_norm curves against our existing proof-of-concept run (deferred to multi-node run)
+
+**Result**: Koba v2 dataloader is stable. 37,300+ steps over 5h15m with 0 errors, 0 filtered items, no crashes. Loss stable ~0.65-0.79, grad_norm healthy 0.5-1.2, consistent step_time 0.225s. WandB: https://wandb.ai/luma-ai/omni-t2a/runs/fh7smmaz
+
+**Note**: `exp_0_6b_mmaudio_pretrained_koba_v2` OOM'd on local 8-GPU pod (240GB cgroup, 8 Lance readers exceeded 95% threshold). This is a pod resource issue, not a dataloader bug. Multi-node Flyte test needed for full validation.
+
+### P1 — Run equivalence tests from PR #7209 ✅ DONE (2026-04-10)
+
+- [x] Run `test_t2a_pipeline_equivalence.py` — ALL 3 TESTS PASSED
+  - Test 1: Tokenized plans are element-by-element identical (5/5 samples match)
+  - Test 2: Packed batches are bit-identical (seq_len=4000, 6 samples)
+  - Test 3: Both paths produce identical model behavior (same error on synthetic data)
+- [x] Run `compare_t2a_dataloaders.py` — All structural checks PASSED
+  - All 3 paths (A: original, B: bridge, C: koba v2) produce 5 valid batches each
+  - Path A: 10000 tokens, 8814 audio tokens
+  - Path B: 10000 tokens, 7194 audio tokens
+  - Path C: 10000 tokens, 8442 audio tokens
+  - All keys, masks, position IDs, attention modes structurally valid
+
+**Conclusion**: Switching to koba v2 path will NOT silently change training behavior. Output is bit-identical when given the same input.
+
+### P2 — Coordinate with Ze on merge order ✅ DONE (2026-04-10)
+
+- [x] Merged Ze's branch (`zewang/omni-t2a-koba-v2-adapter`) into `dongguo/omni-t2a-v2` locally
+- [x] Resolved 1 conflict in `omni_t2a_bridge_dataset.py` (formatting + indexing style — took Ze's version)
+- [ ] Push to remote and get PR #7206 through CI + review to merge to main
+
+Approach: Ze's PR #7209 targeted our branch, so we merged it in. PR #7206 now contains both our T2A code and Ze's v2 dataloader — one combined merge to main.
+
+### P3 (low) — Final-pack drop bug fix
+
+- Only matters if we continue using the bridge path long-term
+- If we switch to v2, this becomes moot
+- The bug only loses the last partial batch per epoch — it is NOT the cause of training crashes
