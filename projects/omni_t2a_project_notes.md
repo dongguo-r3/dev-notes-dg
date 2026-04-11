@@ -3371,3 +3371,33 @@ Analogy: driving off a cliff and landing on a lower road — you survived, but y
 **Prediction:** bcyx2a4o will plateau around loss 2–3. If it reaches < 0.8 (matching the softcap run), that would be surprising.
 
 **Action:** Keep both running to confirm. Compare audio quality at convergence via comparey dashboard.
+
+### Key Insight: It's the LR Trend, Not the LR Value
+
+Across every run, the grad norm peak occurs **exactly when LR stops increasing** (warmup ends), not at any particular LR value:
+
+| Run | LR | Warmup | Grad Norm Onset | LR Reached Max | Grad Norm Peak | Peak ≈ Warmup End? |
+|-----|-----|--------|----------------|----------------|----------------|---------------------|
+| `bcyx2a4o` (formal) | 1e-4 | 5K | step 774 | step 4,950 | **step 5,007** | Yes (within 57 steps) |
+| `5oyhy5dk` (formal, clip) | 1e-4 | 5K | step 724 | step 2,656* | **step 2,672** | Yes (within 16 steps) |
+| `9asejgsk` (pretrained) | 1e-4 | 5K | step 909 | step 4,950 | **step 6,066** | ~1K steps after |
+| `8m75dgpu` (lr2e5) | 2e-5 | 5K | step 1,759 | step 4,194 | **step 4,210** | Yes (within 16 steps) |
+| `2buxm6hq` (softcap) | 2e-5 | 1K | **never >5** | step 990 | 3.0 (healthy) | N/A — no explosion |
+
+*(`5oyhy5dk` was killed before warmup finished; "max" is the final logged LR)
+
+The softcap run shows the same pattern at a bounded scale: grad norm rises during warmup (1.1 → 1.5) and **flattens immediately at step 1,000 when warmup ends**:
+
+| Phase | Steps | Grad Norm | LR | LR Trend |
+|-------|-------|-----------|----|----------|
+| Warmup | 0–500 | 2.8 → 2.0 | 0 → 10e-6 | Increasing |
+| Warmup | 500–1K | 1.1 → rising | 10e-6 → 20e-6 | Increasing |
+| **Post-warmup** | **1K–1.7K** | **~1.5 (flat)** | **2e-5 (constant)** | **Constant** |
+
+**Mechanism:** Each LR increase compounds on top of already-elevated gradients from the modulation feedback loop. It's like pushing a swing — each push (LR increase) adds energy. Once you stop pushing (warmup ends), friction (AdamW's adaptive second moment normalization) dampens the oscillation. Without softcap, the swing goes to 50,000x amplitude before damping. With softcap, it's bounded to ~1.5x.
+
+**Implications:**
+
+- The 5K warmup is particularly harmful for this architecture — more time for compounding to build up
+- Softcap doesn't eliminate the compounding during warmup — it caps how far each layer's modulation can amplify, turning an exponential blowup into a bounded wiggle
+- A shorter warmup (1K) is doubly protective: less time for compounding + softcap bounds the per-step amplification
