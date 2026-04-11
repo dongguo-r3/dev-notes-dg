@@ -3239,3 +3239,39 @@ These are secondary to softcap but worth noting:
 - **Shorter warmup:** Ray3 reference uses 1,000 steps vs omni's 5,000. Shorter warmup reaches stable LR sooner.
 - **Higher weight decay:** T2I uses 0.1; current T2A configs use 0.01. Higher weight decay provides additional regularization on modulation parameters.
 - **Per-layer gradient norm monitoring:** Diagnostic only — would confirm which layers diverge first (deep layers from compounding, or final layer from unguarded output).
+
+### Softcap Experiment Runs (2026-04-11)
+
+New config: `exp_0_6b_mmaudio_koba_v2_softcap` in `projects/kuma/kuma/projects/omni/bagel/configs/t2a.py`
+
+Changes vs `exp_0_6b_mmaudio_pretrained_koba_v2`:
+
+- `softcap_cap=1.0` on `streams_pre[1]`, `streams_post[1]`, `postprocess.out_projs[1]`
+- `lr=2e-5` (down from 1e-4)
+- Warmup: 1,000 steps (down from 5,000, matches Ray3 reference)
+- `grad_clip=1.0` as safety net
+
+Helper function `_apply_softcap(job, cap)` added for reuse across configs.
+
+#### Run 1: Local 8-GPU (softcap validation)
+
+- **Goal:** Quick validation that softcap stabilizes training. Compare grad norm trajectory against the no-softcap `lr2e5` run (`8m75dgpu`) which showed grad norms starting to rise at step ~1,200.
+- **Config:** `exp_0_6b_mmaudio_koba_v2_softcap`
+- **Launch:** `torchrun --standalone --nproc_per_node 8 main.py --config kuma.projects.omni.bagel.configs.t2a.exp_0_6b_mmaudio_koba_v2_softcap --name dongguo/omni_t2a_softcap_local`
+- **Nodes:** 1 (8 GPUs, local interactive pod)
+- **What to watch:** Grad norm should stay bounded (< 3.0) even past step 1,200 where the no-softcap run started diverging. If softcap works, grad norms should follow the Ray3 reference pattern (monotonically decreasing after warmup).
+
+#### Run 2: Kiwi 4-node (softcap at scale)
+
+- **Goal:** Full-scale training with softcap fix. This is the first production-quality run that should train stably to convergence.
+- **Config:** `exp_0_6b_mmaudio_koba_v2_softcap`
+- **Job ID:** `dongguo-gguo-omni-t2a-softcap-4node-kcfb7`
+- **Launch:** `python flyte_main.py --config kuma.projects.omni.bagel.configs.t2a.exp_0_6b_mmaudio_koba_v2_softcap --name dongguo/omni_t2a_softcap_4node --nodes 4 --gpus-per-node 8 --wandb --influxdb --kuma-profiler --cluster kiwi-flyte --username_override dongguo`
+- **Nodes:** 4 (32 GPUs)
+- **What to watch:** Same as local run, plus loss convergence at scale. Target: loss < 0.7 by step 5K with stable grad norms.
+
+#### Stopped Run
+
+- **Job:** `dongguo--omni-t2a-formal-koba-v2-gc-k79b8` (W&B: `5oyhy5dk`)
+- **Config:** `exp_0_6b_mmaudio_formal_koba_v2` (lr=1e-4, grad_clip=1.0, NO softcap)
+- **Reason stopped:** Grad norms at 5,000–8,000 (pre-clip) after 2,400 steps. Grad clip was firing every step — model was not learning meaningfully. Replaced by softcap run.
