@@ -3049,3 +3049,193 @@ Approach: Ze's PR #7209 targeted our branch, so we merged it in. PR #7206 now co
 - Only matters if we continue using the bridge path long-term
 - If we switch to v2, this becomes moot
 - The bug only loses the last partial batch per epoch — it is NOT the cause of training crashes
+
+---
+
+## Gradient Explosion Diagnosis (2026-04-11)
+
+### Symptom
+
+Every omni T2A training run follows the same pattern regardless of learning rate or gradient clipping:
+
+1. **Phase 1 (healthy):** Loss decreases, grad norms are stable (2–3), model is learning
+2. **Phase 2 (onset):** Grad norms start increasing monotonically
+3. **Phase 3 (divergence):** Grad norms reach 10,000–80,000+, loss spikes and becomes unstable
+
+The transition occurs at different steps depending on LR, but the pattern is universal.
+
+### Experiment Summary
+
+W&B project: `luma-ai/omni-t2a`
+
+| Run ID | Config | LR | Grad Clip | Grad Norm Bottom | Step at Bottom | Final Grad Norm |
+|--------|--------|-----|-----------|-----------------|----------------|-----------------|
+| `bcyx2a4o` | `exp_0_6b_mmaudio_formal` | 1e-4 | No | ~2.0 | ~500 | 77,567 |
+| `5oyhy5dk` | `exp_0_6b_mmaudio_formal_koba_v2` | 1e-4 | Yes (1.0) | ~2.0 | ~500 | 7,885 (clipped) |
+| `9asejgsk` | `exp_0_6b_mmaudio_pretrained_koba_v2` | 1e-4 | No | ~1.7 | ~400 | 21,834 |
+| `8m75dgpu` | `..._koba_v2_lr2e5` | 2e-5 | No | 0.84 | ~1,150 | 1.14 (rising) |
+| `hk15yyf7` | `..._koba_v2_lr1e6` | 1e-6 | No | 2.80 | — | Barely learning |
+
+Phase-by-phase for the lr=1e-4 no-clip run (`bcyx2a4o`):
+
+| Phase | Steps | Loss | Grad Norm | LR |
+|-------|-------|------|-----------|-----|
+| Warmup | 0–500 | 1.63→0.77 | 2–3 (stable) | 0→10e-6 |
+| Onset | 500–800 | 0.76 (flat) | 2→5 | 10e-6→13e-6 |
+| Escalation | 800–1200 | 0.75 | 3→44 | ~20e-6 |
+| Runaway | 1200–2000 | 0.79 | 26→2,036 | ~32e-6 |
+| Diverging | 2000–3000 | 1.55 | 767→42,514 | ~50e-6 |
+| Blown up | 3000+ | 3.33 | 9,234→77,567 | ~73e-6 |
+
+### Comparison with Ray3 T2A Reference
+
+The Ray3 reference run (`luma-ai/t2a/ovah4wwn`, `stage001_internal_audio_v2`) uses the **same LR schedule** (5K warmup to 1e-4) and has monotonically **decreasing** grad norms:
+
+| Phase | Ray3 Reference (2.9B, healthy) | Omni T2A (0.6B, explodes) |
+|-------|-------------------------------|--------------------------|
+| 0–500 | grad_norm 5.7 → decreasing | grad_norm 2.9 → stable |
+| 500–1K | grad_norm 2.6 | grad_norm 2.0–5.0 (onset) |
+| 1K–2K | grad_norm **1.0** | grad_norm **14→582** |
+| 2K–5K | grad_norm **0.4→0.25** | grad_norm **5,000→30,000** |
+
+Key config differences between Ray3 and omni:
+
+| Setting | Ray3 T2A (`main_mmaudio.py`) | Omni T2A (`t2a.py`) |
+|---------|------------------------------|---------------------|
+| Model | 2.9B Ray3 DiT | 0.6B Qwen3 MoT (~300M trainable) |
+| Text conditioner | UMT5-XXL (**trainable**) | Frozen Qwen3-0.6B text stream |
+| Architecture | Cross-attention to UMT5 | Packed self-attention (shared QKV) |
+| Modulation | adaLN on all params (both streams trainable) | adaLN only on audio stream, text has none |
+| LR warmup | **1,000 steps** | **5,000 steps** |
+| Weight decay | 1e-5 | 0.01 |
+| Noise shift | -2\*log(5) ≈ -3.22 | -1.6 |
+| **softcap_cap** | N/A (different arch) | **None (disabled)** |
+
+### Root Cause: Modulation Parameter Feedback Loop
+
+The problem is **structural**, not a hyperparameter issue. Lowering LR only delays the onset; the trajectory is the same.
+
+#### Why the model learns well first, then fails
+
+All modulation parameters (`shift`, `scale`, `gate`) are initialized to **exactly zero** (`nn.init.zeros_` in `mmdit_block.py`). At init:
+
+- `modulate(x, shift=0, scale=0)` → `x * (1 + 0) + 0 = x` (identity)
+- `apply_gate(x, gate=0)` → `x * 0 = 0` (kills residual branch)
+
+So early in training, the audio stream behaves like a **plain transformer with no diffusion conditioning and no residual MLP**. This is a well-behaved regime — gradients flow cleanly, loss drops.
+
+To learn diffusion, the model **must** learn non-zero modulation values to condition on the noise timestep. The moment these grow away from zero, the feedback loop begins:
+
+#### The three amplification mechanisms
+
+**1. Unbounded modulation compounds across depth (`blocks_pre_post.py:77-101`)**
+
+In every audio-stream layer:
+
+```python
+x_modulated = norm1(x)                           # unit variance
+x_modulated = x * (1 + scale) + shift            # modulate() — lib/ursa/ursa/models/utils.py:176
+x_modulated = x_modulated * norm_scale            # fixed constant
+x_qkv = attn_qkv(x_modulated)                    # linear projection
+```
+
+The gradient of the loss w.r.t. `scale` is `dL/d(scale) = dL/d(x_modulated) * norm1(x)` — proportional to the activation magnitude. As `scale > 0`, `x_modulated` is larger, which feeds into the next layer, making its `dL/d(scale)` larger.
+
+Across 28 layers, this compounds exponentially:
+
+- If average `|1 + scale|` is 1.05/layer → output amplified `1.05^28 = 3.9x`
+- If average `|1 + scale|` is 1.10/layer → output amplified `1.10^28 = 14.4x`
+- If average `|1 + scale|` is 1.15/layer → output amplified `1.15^28 = 39.2x`
+
+**2. No normalization before final output (`model.py:1151-1169`)**
+
+`FinalVidLayerPacked.forward()`:
+
+```python
+shift, scale = self.adaLN_modulation(self.activation(vec)).chunk(2, dim=-1)
+x = modulate(self.norm_final(x), shift=shift, scale=scale)  # norm BEFORE modulate
+x = self.linear(x)  # directly into loss — NO norm after modulate
+```
+
+`norm_final` normalizes to unit variance *before* modulation. After applying `x * (1 + scale) + shift`, the scale change flows directly into the MSE loss with no buffer. If final scale=2.0, output is ~3x, MSE is ~9x, gradient is ~3x.
+
+**3. Gated residuals compound in backward pass (`blocks_pre_post.py:216-249`)**
+
+```python
+x = x + apply_gate(self.attn_proj(attn), gate=mod_params[2])     # gate = x * gate
+x = x + apply_gate(self.mlp(modulate(norm2(x), shift, scale)), gate=mod_params[5])
+```
+
+Each layer has 2 gates (attention + MLP). Across 28 layers = 56 multiplicative factors in the backward pass. Each gate's gradient is proportional to the attention/MLP output, which is influenced by all previous layers' gates.
+
+#### Why Ray3 doesn't have this problem
+
+Ray3's UMT5-XXL text conditioner is **trainable** — it co-adapts with the denoiser. If activations grow, the text conditioner can adjust its output downward. In omni, the frozen text outputs are fixed, so the audio stream has no relief valve. 100% of gradients funnel into the audio stream parameters.
+
+### The Fix: `softcap_cap` (Already Used by T2I)
+
+The omni T2I (text-to-image) model had the **exact same problem** and solved it. The `softcap` mechanism already exists in the codebase:
+
+```python
+# lib/ursa/ursa/math/numeric.py:71
+def softcap(x, cap=1.0):
+    return cap * tanh(x / cap)   # bounds output to [-cap, cap]
+```
+
+Both `modulate()` and `apply_gate()` in `lib/ursa/ursa/models/utils.py` already accept `softcap_cap` and call `softcap()` when it's not None. The T2A configs simply have it set to `None` (disabled).
+
+#### T2I production configs all enable softcap
+
+Every T2I training config enables softcap on the generation stream (stream[1]):
+
+```python
+# scaling_vl.py:77-78 (stages < 5.0)
+job.trainer.denoiser.module.blocks[0].streams_pre[1].softcap_cap = 1.0
+job.trainer.denoiser.module.blocks[0].streams_post[1].softcap_cap = 1.0
+
+# scaling_vl.py:446-448 (stages >= 5.0) — added postprocess
+job.trainer.denoiser.module.blocks[0].streams_pre[1].softcap_cap = 1.0
+job.trainer.denoiser.module.blocks[0].streams_post[1].softcap_cap = 1.0
+job.trainer.denoiser.module.postprocess.out_projs[1].softcap_cap = 1.0
+
+# scaling_vl.py:1054-1056 (stages >= 6.2) — relaxed to 10.0
+job.trainer.denoiser.module.blocks[0].streams_pre[1].softcap_cap = 10.0
+job.trainer.denoiser.module.blocks[0].streams_post[1].softcap_cap = 10.0
+job.trainer.denoiser.module.postprocess.out_projs[1].softcap_cap = 10.0
+```
+
+Consistent across `scaling_vl.py`, `scaling_8b.py`, `scaling.py`, `scaling_vl_dmd.py`, `scaling_vl_cfg_distill.py`, `scaling_vl_tdm.py`, `moe_experiments.py`. Zero exceptions.
+
+#### What softcap does at each location
+
+| Location | What it bounds | Which amplifier it prevents |
+|----------|---------------|----------------------------|
+| `streams_pre[1].softcap_cap` | `shift` and `scale` in pre-attention `modulate()` | #1 — unbounded modulation |
+| `streams_post[1].softcap_cap` | `gate` in `apply_gate()`, `shift`/`scale` in MLP | #3 — gated residual compounding |
+| `postprocess.out_projs[1].softcap_cap` | `shift` and `scale` in `FinalVidLayerPacked` | #2 — unguarded final output |
+
+#### T2I evolution: 1.0 → 10.0
+
+The T2I team started with `softcap_cap=1.0` (tight bound) for training stability, then relaxed to `10.0` at stage 6.2. This suggests tight bounds are needed for initial training; they can be loosened once the model is well-trained.
+
+### Proposed Fix for T2A
+
+Apply the same 3-line config change to all T2A configs:
+
+```python
+# In get_t2a_baseline() or per-experiment config:
+job.trainer.denoiser.module.blocks[0].streams_pre[1].softcap_cap = 1.0
+job.trainer.denoiser.module.blocks[0].streams_post[1].softcap_cap = 1.0
+job.trainer.denoiser.module.postprocess.out_projs[1].softcap_cap = 1.0
+```
+
+No architecture changes needed — the infrastructure is fully wired, just disabled via `None` default.
+
+### Additional Stabilization (Lower Priority)
+
+These are secondary to softcap but worth noting:
+
+- **Lower LR for smaller model:** Ray3 reference uses lr=1e-4 for 2.9B params. Omni has ~300M trainable. lr=2e-5 to 5e-5 may be more appropriate.
+- **Shorter warmup:** Ray3 reference uses 1,000 steps vs omni's 5,000. Shorter warmup reaches stable LR sooner.
+- **Higher weight decay:** T2I uses 0.1; current T2A configs use 0.01. Higher weight decay provides additional regularization on modulation parameters.
+- **Per-layer gradient norm monitoring:** Diagnostic only — would confirm which layers diverge first (deep layers from compounding, or final layer from unguarded output).
