@@ -3318,3 +3318,56 @@ job.trainer.denoiser.module.postprocess.out_projs[1].softcap_cap = 1.0
 ```
 
 This is carrying over an already-proven stabilization that the T2I team developed for the same architecture with the same problem — not a speculative fix.
+
+### Early Results (2026-04-11, ~6K steps)
+
+#### Softcap run (`2buxm6hq`) — Stable, working as intended
+
+Config: `exp_0_6b_mmaudio_koba_v2_softcap` (softcap=1.0, lr=2e-5, warmup=1K)
+
+| Phase | Steps | Grad Norm | Loss | LR | Status |
+|-------|-------|-----------|------|-----|--------|
+| Warmup | 0–200 | 2.8 | 1.64 | 0→2e-6 | Stable (modulation ≈ 0) |
+| Learning | 200–500 | 2.0 | 1.18 | 7e-6 | Decreasing |
+| Active learning | 500–1K | **1.1** (bottom) | 0.77 | 15e-6 | Good convergence |
+| Post-warmup | 1K–1.7K | **1.56** (flat) | 0.73 | **2e-5 (max)** | Warmup done, **stable** |
+
+Grad norm settled at ~1.5 after warmup completed at step 1,000. It is **not growing** — this matches the healthy Ray3 reference pattern. Last 10 steps show grad norms in [1.08, 1.72], loss in [0.48, 0.78]. Softcap is doing its job.
+
+Comparison at similar step counts:
+
+| Metric at step ~1.5K | Softcap run | No-softcap lr=2e-5 (`8m75dgpu`) | No-softcap lr=1e-4 (`bcyx2a4o`) |
+|-----------------------|-------------|----------------------------------|----------------------------------|
+| Grad norm | **1.56** (stable) | 1.14 (rising) | 361 (exploding) |
+| Loss | **0.73** | 0.87 | 0.78 |
+
+#### No-clip formal run (`bcyx2a4o`) — Surprising partial self-recovery
+
+Config: `exp_0_6b_mmaudio_formal` (NO softcap, NO grad_clip, lr=1e-4, warmup=5K)
+
+Fine-grained grad norm trajectory after the explosion:
+
+| Phase | Steps | Mean Grad Norm | Median | Max | Loss |
+|-------|-------|----------------|--------|-----|------|
+| Still climbing | 4.5K–5.0K | 54,685 | 53,663 | 105,085 | 5.27 |
+| **PEAK** | 5.0K–5.2K | **66,075** | 64,827 | **118,037** | 7.01 |
+| Recovering | 5.2K–5.5K | 55,305 | 54,099 | 95,115 | 5.47 |
+| Recovering | 5.5K–5.7K | 50,595 | 50,538 | 84,140 | 5.03 |
+| Recovering | 5.7K–6.0K | 45,600 | 44,684 | 81,752 | 5.05 |
+| Still recovering | 6.0K–6.1K | 39,880 | 38,472 | 68,075 | 4.66 |
+
+The grad norm peaked at step ~5,200 and has been **monotonically decreasing** since, from 66K → 40K.
+
+**Why this happens:** The LR warmup finished at step 5,000. During warmup, the LR kept increasing, adding fuel to the explosion. Once LR stabilized at 1e-4, **AdamW's adaptive second moment** (`sqrt(v_t)`) caught up with the gradient magnitudes. AdamW normalizes each parameter's update by its running gradient variance — so even with grad norms of 50K, the actual parameter updates are bounded by `lr / sqrt(v_t + eps)`. Without more fuel (increasing LR), the system starts self-correcting.
+
+**Will it recover to the same loss as the softcap run?** Almost certainly **no**, for two reasons:
+
+1. **Wasted compute.** Loss is 4.7 at step 6K (bcyx2a4o) vs 0.73 at step 1.7K (softcap). Even if bcyx2a4o recovers, it wasted ~5K steps in the explosion/recovery cycle.
+
+2. **Corrupted weight space.** During the explosion, scale/shift/gate parameters across all 28 layers were pushed far from their optimal values. AdamW can stabilize the dynamics but can't undo the damage to the weight space. The model will converge to a different (likely worse) local minimum.
+
+Analogy: driving off a cliff and landing on a lower road — you survived, but you're not on the same path as someone who took the bridge.
+
+**Prediction:** bcyx2a4o will plateau around loss 2–3. If it reaches < 0.8 (matching the softcap run), that would be surprising.
+
+**Action:** Keep both running to confirm. Compare audio quality at convergence via comparey dashboard.
