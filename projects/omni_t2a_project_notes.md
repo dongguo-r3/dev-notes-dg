@@ -3275,3 +3275,46 @@ Helper function `_apply_softcap(job, cap)` added for reuse across configs.
 - **Job:** `dongguo--omni-t2a-formal-koba-v2-gc-k79b8` (W&B: `5oyhy5dk`)
 - **Config:** `exp_0_6b_mmaudio_formal_koba_v2` (lr=1e-4, grad_clip=1.0, NO softcap)
 - **Reason stopped:** Grad norms at 5,000–8,000 (pre-clip) after 2,400 steps. Grad clip was firing every step — model was not learning meaningfully. Replaced by softcap run.
+
+### Softcap vs Grad Clip — Why Softcap Works Where Grad Clip Doesn't
+
+Both share the same core motivation — bounding values to prevent runaway growth — but they operate at fundamentally different points in the computation:
+
+| | `grad_clip` | `softcap` |
+|---|---|---|
+| **What it bounds** | Gradient norm (after backward, before optimizer step) | Activation values (during forward pass) |
+| **When it acts** | After the damage is done — gradients already computed | Prevents the damage — activations never grow large |
+| **Mechanism** | Rescales entire gradient vector: `g * min(1, clip/‖g‖)` | Per-element smooth clamp: `cap * tanh(x/cap)` |
+| **Information loss** | Preserves direction, destroys magnitude | Preserves sign and relative ordering, compresses magnitude |
+| **Differentiable** | No (not part of the computation graph) | Yes — `tanh` has well-behaved gradients that naturally shrink as `|x|` grows |
+
+The key difference is where in the feedback loop they intervene:
+
+```
+Forward:  modulation params → activations grow → loss grows
+                ↑                                    ↓
+          optimizer step ← grad_clip ← gradients grow
+```
+
+- **Softcap** acts at the **top** of this loop (bounds activations during forward). Large activations never produce large losses, so gradients stay small naturally.
+- **Grad clip** acts at the **bottom** (bounds gradients before the optimizer step). By then the forward pass already produced a huge loss with huge gradients — clipping just truncates them.
+
+This explains the `5oyhy5dk` run: grad_clip=1.0 was firing every step with pre-clip norms of 5,000–8,000. The model was effectively getting random-direction updates with tiny magnitude — not learning. Softcap prevents activations from growing in the first place, so grad_clip rarely activates — it becomes a safety net, not a crutch.
+
+### Softcap Is Not a Novel Fix — It's the T2I Production Pattern
+
+The omni T2I (text-to-image) model uses the exact same `softcap_cap` on the same three locations. Stream[0] is always text/understanding, stream[1] is always the generation stream (vision or audio). The block architecture (`BagelMultiStreamBlock`), modulation mechanism (`modulate()`, `apply_gate()`), and the code paths where `softcap_cap` is checked are identical — the only difference is the latent dimension (128 for image, 20 for MMAudio audio).
+
+```python
+# T2I (scaling_vl.py) — vision generation stream
+job.trainer.denoiser.module.blocks[0].streams_pre[1].softcap_cap = 1.0
+job.trainer.denoiser.module.blocks[0].streams_post[1].softcap_cap = 1.0
+job.trainer.denoiser.module.postprocess.out_projs[1].softcap_cap = 1.0
+
+# T2A (t2a.py, _apply_softcap) — audio generation stream (identical)
+job.trainer.denoiser.module.blocks[0].streams_pre[1].softcap_cap = 1.0
+job.trainer.denoiser.module.blocks[0].streams_post[1].softcap_cap = 1.0
+job.trainer.denoiser.module.postprocess.out_projs[1].softcap_cap = 1.0
+```
+
+This is carrying over an already-proven stabilization that the T2I team developed for the same architecture with the same problem — not a speculative fix.
