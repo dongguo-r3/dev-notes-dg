@@ -3401,3 +3401,69 @@ The softcap run shows the same pattern at a bounded scale: grad norm rises durin
 - The 5K warmup is particularly harmful for this architecture — more time for compounding to build up
 - Softcap doesn't eliminate the compounding during warmup — it caps how far each layer's modulation can amplify, turning an exponential blowup into a bounded wiggle
 - A shorter warmup (1K) is doubly protective: less time for compounding + softcap bounds the per-step amplification
+
+### Ablation Runs: Disentangle Softcap vs Warmup Length (2026-04-11)
+
+The softcap run (`2buxm6hq`) changed two variables simultaneously: added softcap AND shortened warmup from 5K to 1K. We cannot tell which change is responsible for the stability. These two ablation runs isolate each variable.
+
+#### Ablation 1: Softcap + 5K warmup (isolates warmup length)
+
+- **Config:** `exp_0_6b_mmaudio_koba_v2_softcap_warmup5k`
+- **Settings:** softcap=1.0, lr=2e-5, warmup=**5,000** steps, grad_clip=1.0
+- **Job ID:** `dongguo-a-ablation-softcap-warmup5k-kf555`
+- **Compare with:** `2buxm6hq` (softcap + 1K warmup)
+- **Question:** With softcap enabled, does the 5K warmup still cause grad norm to grow significantly past the level where the 1K-warmup run flattened (~1.5)?
+  - If grad norm keeps growing past step 1K → warmup length matters even with softcap
+  - If grad norm flattens at ~1.5 regardless → softcap alone is sufficient
+
+#### Ablation 2: No softcap + 500 warmup (isolates softcap)
+
+- **Config:** `exp_0_6b_mmaudio_koba_v2_no_softcap_warmup500`
+- **Settings:** NO softcap, lr=1e-4, warmup=**500** steps, NO grad_clip
+- **Job ID:** `dongguo-lation-no-softcap-warmup500-kb381`
+- **Compare with:** `bcyx2a4o` (no softcap + 5K warmup, lr=1e-4)
+- **Question:** With a very short warmup (500 steps), does training stay stable without softcap?
+  - If grad norm peaks at step ~500 and recovers quickly → short warmup alone is sufficient
+  - If it still explodes → softcap is necessary regardless of warmup length
+
+#### Ablation Matrix
+
+| | Short warmup (≤1K) | Long warmup (5K) |
+|---|---|---|
+| **With softcap** | `2buxm6hq` — stable, grad_norm ~1.5 | Ablation 1 (`kf555`) — **running** |
+| **Without softcap** | Ablation 2 (`kb381`) — **running** | `bcyx2a4o` — exploded to 118K, recovering |
+
+### Experiments Killed (2026-04-13)
+
+All running WandB runs in `luma-ai/omni-t2a` were stopped on 2026-04-13.
+
+| Run Name | WandB ID | Last Step | Checkpoint Root (S3) |
+|---|---|---|---|
+| `omni_t2a/0_6b_formal_16gpu` | `bcyx2a4o` | 15,790 | `s3://ai-lumalabs-checkpoints-ap-se-2/dongguo/omni_t2a/0_6b_formal_16gpu/` |
+| `omni_t2a/0_6b_formal_32gpu` | `ie0zgoca` | 12,887 | `s3://ai-lumalabs-checkpoints-ap-se-2/dongguo/omni_t2a/0_6b_formal_32gpu/` |
+| `dongguo/omni_t2a_koba_v2_compare` | `9asejgsk` | 23,483 | `s3://ai-lumalabs-checkpoints-ap-se-2/dongguo/dongguo/omni_t2a_koba_v2_compare/` |
+| `dongguo/omni_t2a_koba_v2_lr1e6` | `hk15yyf7` | 20,743 | `s3://ai-lumalabs-checkpoints-ap-se-2/dongguo/dongguo/omni_t2a_koba_v2_lr1e6/` |
+| `dongguo/omni_t2a_koba_v2_lr2e5` | `8m75dgpu` | 20,363 | `s3://ai-lumalabs-checkpoints-ap-se-2/dongguo/dongguo/omni_t2a_koba_v2_lr2e5/` |
+| `dongguo/omni_t2a_softcap_4node` | `2buxm6hq` | 10,279 | `s3://ai-lumalabs-checkpoints-ap-se-2/dongguo/dongguo/omni_t2a_softcap_4node/` |
+| `dongguo/omni_t2a_ablation_softcap_warmup5k` | `x8474d3m` | 16,620 | `s3://ai-lumalabs-checkpoints-ap-se-2/dongguo/dongguo/omni_t2a_ablation_softcap_warmup5k/` |
+| `dongguo/omni_t2a_ablation_no_softcap_warmup500` | `fmrbgjd0` | 16,883 | `s3://ai-lumalabs-checkpoints-ap-se-2/dongguo/dongguo/omni_t2a_ablation_no_softcap_warmup500/` |
+
+### Single-Shift Experiments (2026-04-14)
+
+**Commit:** `f49555e286` on branch `dongguo/omni-t2a-v2`
+
+**Key change:** `sigma_shift` changed from 3.0 to 1.0 in `exp_0_6b_mmaudio_formal`. With `sigma_shift=1.0`, the shift is a no-op (`sigma' = sigma`), making the Omni T2A noise schedule identical to Ray3 T2A production (both: `TruncatedNormal(shift=-1.6, scale=1.0)`, no sigma remap).
+
+**Shared settings (both runs):**
+
+- Base config: `exp_0_6b_mmaudio_formal_koba_v2` (koba v2 native packing, internal-audio-v2-english)
+- Noise: `logSNR ~ TruncatedNormal(shift=-1.6, std=2.0)`, `sigma_shift=1.0`
+- lr=2e-5, warmup=500 steps, grad_clip=1.0, save_every=1K
+- 4 nodes (32 GPUs) on kiwi-flyte
+
+| Run Name | Flyte Job ID | Config | Softcap |
+|---|---|---|---|
+| `dongguo/omni_t2a_single_shift_softcap` | `dongguo-ni-t2a-single-shift-softcap-ka720` | `exp_0_6b_mmaudio_formal_koba_v2_single_shift_softcap` | cap=1.0 |
+| `dongguo/omni_t2a_single_shift_no_softcap` | `dongguo-t2a-single-shift-no-softcap-k6714` | `exp_0_6b_mmaudio_formal_koba_v2_single_shift_no_softcap` | None |
+
+**Early observation:** Loss and grad norm curves are nearly identical between the two runs in early training, which is expected — softcap only activates when modulation parameters grow large enough to hit the `tanh(x/cap)*cap` boundary. Divergence (if any) should appear post-warmup around step 500-2000.
