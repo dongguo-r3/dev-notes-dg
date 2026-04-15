@@ -8,7 +8,7 @@
 | [Audio Data Pipeline](projects/audio_data_pipeline.md) | Dong | 🟡 In Progress | Medium | 2026-04-08 |
 | [Audio Processing](projects/audio_processing.md) | Dong | 🟢 Done | Low | 2026-03-18 |
 | [Data Infra](projects/data_infra.md) | Dong | 🟢 Done | Low | 2026-03-18 |
-| [Omni Model T2A](projects/omni_model_t2a.md) | Dong | 🟡 In Progress | High | 2026-04-08 |
+| [Omni Model T2A](projects/omni_t2a_project_notes.md) | Dong | 🟡 In Progress | High | 2026-04-08 |
 | [Omni Model T2V](projects/omni_model_t2v.md) | Dong | 🟡 In Progress | High | 2026-04-06 |
 | [Video Captioning](projects/video_captioning.md) | Dong | 🟡 In Progress | Medium | 2026-04-08 |
 | [Video Captioning — Director Style](projects/video_captioning_director_style.md) | Dong | 🟡 In Progress | Medium | 2026-04-08 |
@@ -32,7 +32,7 @@
 - **Sequence parallelism**: Documented Ulysses, Ring Attention, Flash Attention, FSDP — their roles, tradeoffs, and 2D M×N GPU grid combination
 - **Attention masking**: Documented FlexAttention BlockMask mechanics — mask_mod function, block classification (FULL/MIXED/ZERO), `kv_indices`/`full_kv_indices` index structure, concrete 16-token 2-sample example
 - **OmniPreprocessData**: Documented all mask/index fields — `packed_und/gen_token_masks`, `packed_und/gen_token_indexes`, `scatter_indices`, `flex_attn_mask`, `flash4_attn_mask`, `modulation_mask`
-- All notes appended to `projects/omni_model_t2a.md`
+- All notes appended to `projects/omni_t2a_project_notes.md`
 
 ### 2026-04-06 — System setup
 - **System**: Project management system initialized. 6 existing worker files migrated into `projects/`.

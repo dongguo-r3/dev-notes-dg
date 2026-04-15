@@ -1,23 +1,8 @@
 # Omni T2A Project Notes
 
-> **What this note is for:** Architecture, implementation, and training details for adding a text-to-audio (T2A) generation stream to the uni-1 Omni MoT model. Covers design decisions, data pipeline, attention masking mechanics, and sequence parallelism.
->
-> | Area | Status | Latest |
-> |---|---|---|
-> | Model architecture | ✅ Implemented | `AudioPreprocess` + `Qwen3TextAudioPackedPreprocess` in `model.py` |
-> | Training configs | ✅ Implemented | MMAudio (16kHz) + Hunyuan DAC VAE (48kHz) variants |
-> | Smoke test (1 GPU) | ✅ Passing | 11 bugs found and fixed |
-> | Full training (8 GPU) | 🔲 Not yet run | Config ready: `exp_0_6b_mmaudio` |
-> | Multi-node Flyte launch | 🔲 TODO | — |
-> | Inference processor | 🔲 TODO | — |
-> | Evaluation (FAD/CLAP) | 🔲 TODO | vs reference run `tage001-internal-audio-v2-k3600` |
-
----
-
-**Started:** 2026-04-07
-**Author:** Dong Guo
+**Started:** 2026-04-07  
+**Author:** Dong Guo  
 **Branch:** development branch (not merged to main)
-**Last Updated:** 2026-04-08
 
 ---
 
@@ -2427,18 +2412,6 @@ torchrun --standalone --nproc_per_node 8 main.py \
 - [ ] Sequence parallelism (Ulysses) for longer sequences
 - [ ] Multi-node Flyte launch config
 - [ ] Evaluation metrics (FAD, CLAP score)
-- [ ] Extend to 3-stream model (text + vision + audio) when ready to merge
-
----
-
-## 2026-04-08 — Data Loader & Parameter Initialization
-
-### Tasks
-- [ ] Verify data loader is working correctly and efficiently
-- [ ] Verify model module parameters are properly loaded and initialized
-
-### Notes / Running Log
-- 2026-04-08: Session started. Focusing on data loader correctness/efficiency and parameter loading/initialization.
 
 ---
 
