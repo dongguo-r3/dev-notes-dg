@@ -27,6 +27,48 @@ consistent and up to date.
 8. Skills are stored in `skills/` — reference them by filename when asked to run a procedure.
 9. Never modify `claude.md` unless explicitly asked to by the user.
 
+## File Naming Convention
+
+Worker files in `projects/` use a **hierarchical underscore-separated** naming scheme:
+
+```
+level1_level2_..._levelK.md
+```
+
+- Levels go from **most general → most specific**, left to right.
+- Use only lowercase letters, digits, and underscores — no spaces or hyphens.
+- Do **not** append generic suffixes like `_notes`, `_logs`, or `_project`; the name itself should be descriptive.
+- A more specific sub-topic of an existing file gets additional levels (e.g. `video_captioning.md` → `video_captioning_director_style.md`).
+
+Examples:
+| ❌ Old style | ✅ New style |
+|---|---|
+| `omni_t2a_project_notes.md` | `omni_model_t2a.md` |
+| `audio_data_processing_logs.md` | `audio_data_pipeline.md` |
+| `vibevoice_asr.md` | `audio_asr_vibevoice.md` |
+| `video_director_captioning.md` | `video_captioning_director_style.md` |
+
+## Intro Section Requirement
+
+Every worker file must open with an **intro block** (before the Meta section) that covers:
+1. **Purpose** — what this file is used for, in one sentence.
+2. **Latest summary** — the current state of content, in a format appropriate to the file:
+   - Use a **status table** for active projects tracking multiple workstreams.
+   - Use a **categorized table** for reference catalogs (datasets, configs, etc.).
+   - Use a **bullet list** for concept/reference docs or scratchpads.
+
+Format the intro as a Markdown blockquote (`>`), for example:
+
+```markdown
+> **What this note is for:** ...
+>
+> | Area | Status | Latest |
+> |---|---|---|
+> | ... | ... | ... |
+```
+
+Update the intro summary whenever the file's content changes significantly.
+
 ## Canonical Vocabulary
 | Term | Meaning |
 |---|---|

@@ -45,6 +45,12 @@ The director-centered framing instead asks the model to annotate *why* a shot wa
 
 ---
 
+## To Explore
+
+- [ ] **2026-04-08**: Survey the concept of "camera-guided ____" — understand what it means to use camera motion/trajectory as an explicit conditioning or guiding signal in video generation/captioning. Fill in the blank and document findings here.
+
+---
+
 ## References
 
 - Slack demo that inspired the director-centered approach: https://luma-ai.slack.com/archives/C0816AKQ4SJ/p1775265471937659?thread_ts=1775262604.370749&cid=C0816AKQ4SJ

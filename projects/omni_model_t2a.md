@@ -17,6 +17,7 @@
 **Started:** 2026-04-07
 **Author:** Dong Guo
 **Branch:** development branch (not merged to main)
+**Last Updated:** 2026-04-08
 
 ---
 
@@ -2426,6 +2427,18 @@ torchrun --standalone --nproc_per_node 8 main.py \
 - [ ] Sequence parallelism (Ulysses) for longer sequences
 - [ ] Multi-node Flyte launch config
 - [ ] Evaluation metrics (FAD, CLAP score)
+- [ ] Extend to 3-stream model (text + vision + audio) when ready to merge
+
+---
+
+## 2026-04-08 — Data Loader & Parameter Initialization
+
+### Tasks
+- [ ] Verify data loader is working correctly and efficiently
+- [ ] Verify model module parameters are properly loaded and initialized
+
+### Notes / Running Log
+- 2026-04-08: Session started. Focusing on data loader correctness/efficiency and parameter loading/initialization.
 
 ---
 

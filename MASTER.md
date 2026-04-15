@@ -8,7 +8,7 @@
 | [Audio Data Pipeline](projects/audio_data_pipeline.md) | Dong | 🟡 In Progress | Medium | 2026-04-08 |
 | [Audio Processing](projects/audio_processing.md) | Dong | 🟢 Done | Low | 2026-03-18 |
 | [Data Infra](projects/data_infra.md) | Dong | 🟢 Done | Low | 2026-03-18 |
-| [Omni Model T2A](projects/omni_model_t2a.md) | Dong | 🟡 In Progress | High | 2026-04-07 |
+| [Omni Model T2A](projects/omni_model_t2a.md) | Dong | 🟡 In Progress | High | 2026-04-08 |
 | [Omni Model T2V](projects/omni_model_t2v.md) | Dong | 🟡 In Progress | High | 2026-04-06 |
 | [Video Captioning](projects/video_captioning.md) | Dong | 🟡 In Progress | Medium | 2026-04-08 |
 | [Video Captioning — Director Style](projects/video_captioning_director_style.md) | Dong | 🟡 In Progress | Medium | 2026-04-08 |
@@ -18,6 +18,9 @@
 ---
 
 ## Daily Logs
+
+### 2026-04-08 — Omni T2A: data loader + parameter init
+- **Omni T2A**: Verifying data loader correctness and efficiency; verifying model parameter loading and initialization
 
 ### 2026-04-08 — EP dataset exploration + dense captioning sync
 - **Sticky Notes**: Preliminary findings from reading ep_dataset examples at `s3://ai-lumalabs-datasets-ap-se-2/haoxiang/ep_vlm/0319_mix2.lance`
