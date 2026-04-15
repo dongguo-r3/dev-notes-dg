@@ -3467,3 +3467,183 @@ All running WandB runs in `luma-ai/omni-t2a` were stopped on 2026-04-13.
 | `dongguo/omni_t2a_single_shift_no_softcap` | `dongguo-t2a-single-shift-no-softcap-k6714` | `exp_0_6b_mmaudio_formal_koba_v2_single_shift_no_softcap` | None |
 
 **Early observation:** Loss and grad norm curves are nearly identical between the two runs in early training, which is expected — softcap only activates when modulation parameters grow large enough to hit the `tanh(x/cap)*cap` boundary. Divergence (if any) should appear post-warmup around step 500-2000.
+
+---
+
+## Training Efficiency Analysis (2026-04-14)
+
+Compared Omni T2A step time against the Ray3 T2A reference run (`luma-ai/t2a/runs/ovah4wwn`, 2.9B model, 16 nodes). Omni T2A was ~10x slower per step despite being a 5x smaller model. Two root causes identified.
+
+### Issue 1: Uncompiled FlexAttention
+
+**Background — `flex_attention` API vs `torch.compile`:** These are two separate things. `use_flex_attention=True` (on `Qwen3TextAudioPackedPreprocess.Config`) selects PyTorch's `flex_attention` API for expressing the attention pattern — the model calls `create_block_mask` to define the sparse causal-for-text/full-for-audio mask, and dispatches attention through the `flex_attention` kernel. This was enabled in T2A from day one. Separately, `torch.compile` (triggered by `Forge.Config.compiler`) compiles the model graph including the `flex_attention` function into fused Triton kernels that exploit block-sparsity from the `BlockMask`. Without `torch.compile`, `flex_attention` still runs correctly — it just evaluates the mask function in eager mode, which is significantly slower.
+
+**Problem:** The T2A forge config (`_t2a_denoiser_forge()` in `t2a.py`) was missing a `compiler` setting. Every other Omni Bagel training config (T2I, VL, distillation) sets `denoiser.compiler = SimplyCallApplyCompile.Config(...)`, but T2A did not. This was easy to miss because `use_flex_attention=True` appeared in 10+ places across model and dataset configs, giving the impression that flex attention was fully optimized. The `compiler` field lives on a completely different config object (`Forge.Config` in `_t2a_denoiser_forge()`) with no cross-reference.
+
+The compilation path: `Forge.Config.compiler` → `SimplyCallApplyCompile` → `Qwen3MMDiT.apply_compile()` → `BagelMultiStreamBlock.apply_compile()` (in `blocks.py:192`) → `torch.compile(flex_attention, fullgraph=True)`.
+
+**Fix:** Added `SimplyCallApplyCompile.Config(dynamic=False, fullgraph=False)` to `_t2a_denoiser_forge()`. All training experiments inherit this. Debug configs keep `compiler=None` for fast iteration.
+
+**Verification run:** `dongguo/omni_t2a_single_shift_softcap_compiled` (Flyte job `dongguo-ngle-shift-softcap-compiled-k54d7`), launched 2026-04-14 22:06 UTC on 4 nodes, kiwi-flyte.
+
+### Issue 2: Sequential MMAudio Encoding
+
+**Problem:** The Omni T2A trainer (`omni_t2a.py:148-161`) encodes audio clips one-by-one in a Python loop:
+
+```python
+for audio_tensor in x_audio:          # ~30 clips per packed sequence
+    z0_i = self.audio_encoder(audio_tensor)  # one forward pass per clip
+```
+
+Ray3 T2A encodes the entire batch in a single call: `z0 = self.encode(x)`.
+
+This causes two problems:
+
+1. **Slow baseline encoding** — ~30 sequential encoder calls vs 1 batched call.
+2. **Step-time spikes from straggler ranks** — different ranks pack different numbers of clips (20 vs 35). Encoding time is proportional to clip count. FSDP AllGather requires all ranks to sync before forward pass, so the slowest rank blocks everyone. Observed as increasingly frequent step-time spikes in InfluxDB metrics.
+
+**Slack discussion:** Thread [#omni-t2a 2026-04-14](https://luma-ai.slack.com/archives/C06U65FE5P1/p1776201153390919) — Wei-An Lin confirmed the straggler hypothesis via InfluxDB rank-0 view: rank 0 enters forward quickly but waits for other ranks, showing up as long step_time even though rank 0 itself wasn't slow.
+
+---
+
+### Batched MMAudio Encoding: Design & Analysis
+
+#### Terminology
+
+Audio segments per clip:
+
+- **valid-audio**: the real speech audio
+- **silent-addon**: a short silence of random duration (0.5–1.0s) deliberately appended to every clip, including the longest in the batch
+- **silent-padded**: additional silence padding to make all clips in the batch the same length (for batched encoding only, discarded after)
+
+Corresponding embedding frames:
+
+- **valid-frames**: latent frames from valid-audio
+- **addon-frames**: latent frames from silent-addon
+- **padded-frames**: latent frames from silent-padded (discarded after encoding)
+
+#### Algorithm
+
+1. **Append silent-addon** to every clip: `clip_with_addon = [valid-audio | silent-addon(random 0.5–1.0s)]`. Every clip gets an addon, including the longest.
+2. **Pad to batch max**: pad all clips with silent-padded to `max(clip_with_addon lengths)`.
+3. **Batch-encode**: single MMAudio encoder forward pass on `[B, T_max]`.
+4. **Truncate**: for each clip, keep `valid-frames + addon-frames`, discard padded-frames. Pack into the sequence as usual.
+
+The attention mask in MMAudio's mid-block `AttnBlock1D` masks out padded-frames (plus a small buffer — see analysis below). No changes to loss or packing logic.
+
+```python
+# Pseudocode
+for i in range(B):
+    addon_duration = random.uniform(0.5, 1.0)  # seconds
+    addon_samples = int(addon_duration * sample_rate)
+    clips_with_addon[i] = F.pad(clips[i], (0, addon_samples))
+
+batch_padded = pad_to_max_length(clips_with_addon)           # [B, T_max]
+attn_mask = build_padding_mask(clips_with_addon_lengths, T_max, buffer=3)
+z0_all = mmaudio_encoder(batch_padded, attn_mask=attn_mask)  # [B, C, T_latent_max]
+
+for i in range(B):
+    truncation_frames = compute_latent_frames(clips_with_addon[i])
+    z0_used[i] = z0_all[i, :, :truncation_frames]
+
+packed_sequence = pack(z0_used, text_tokens)
+```
+
+#### MMAudio Encoder Architecture Analysis
+
+The MMAudio 16k encoder pipeline:
+
+1. **Mel spectrogram**: STFT with `hop_size=256`, `win_size=1024` → `[B, 80, T_mel]`
+2. **Encoder1D**: conv layers + one self-attention layer + more conv layers → `[B, 20, T_latent]`
+   - Config: `ch_mult=(1,2,4)`, `num_res_blocks=2`, `down_layers=[0]` (stride-2 at level 0), `kernel_size=3`
+   - Total temporal compression: mel hop (256) × encoder stride (2) = 512 samples per latent frame = 0.032s
+
+The encoder has three stages: pre-attention CNNs → global self-attention → post-attention CNNs.
+
+#### Receptive Field Calculation
+
+Each `MPConv1D(kernel_size=3)` uses symmetric padding (`padding = k//2 = 1`). The receptive field formula: `RF = RF_prev + (kernel_size - 1) × cumulative_stride`.
+
+**Pre-attention CNN layers** (conv_in → Level 0–2 → Mid ResBlock1):
+
+| Layer | Kernel | Cumul. Stride | RF (mel frames) |
+|---|---|---|---|
+| input | — | 1 | 1 |
+| conv_in | 3 | 1 | 3 |
+| L0 ResBlock0 (2 convs) | 3 | 1 | 5 → 7 |
+| L0 ResBlock1 (2 convs) | 3 | 1 | 9 → 11 |
+| L0 Downsample (avg_pool k=2 s=2) | 2 | **2** | **12** |
+| L1 ResBlock0 (2 convs) | 3 | 2 | 16 → 20 |
+| L1 ResBlock1 (2 convs) | 3 | 2 | 24 → 28 |
+| L2 ResBlock0 (2 convs) | 3 | 2 | 32 → 36 |
+| L2 ResBlock1 (2 convs) | 3 | 2 | 40 → 44 |
+| Mid ResBlock1 (2 convs) | 3 | 2 | 48 → **52** |
+
+**CNN-only receptive field before attention: 52 mel frames.**
+
+Since padding is symmetric, each side needs half: **26 mel frames**.
+
+Converting to audio: 26 × 256 (hop) + 512 (half window) = **7,168 samples = 0.448 seconds**.
+
+So ~0.45s of silence beyond the last valid audio frame is sufficient for the CNN layers to have fully valid inputs at the boundary.
+
+**Mid-block AttnBlock1D**: global self-attention (`F.scaled_dot_product_attention`). Every frame attends to every other frame → receptive field becomes the **entire sequence**.
+
+**Post-attention CNN layers** (Mid ResBlock2 + conv_out = 3 conv layers, k=3):
+
+| Layer | Kernel | Cumul. Stride | Local RF (post-downsample frames) |
+|---|---|---|---|
+| Mid ResBlock2 conv1 | 3 | 2 | 3 |
+| Mid ResBlock2 conv2 | 3 | 2 | 5 |
+| conv_out | 3 | 2 | **7** |
+
+Local receptive field of post-attention convolutions: **7 post-downsample frames ≈ 3–4 frames on each side**.
+
+In seconds: ~3 frames × 2 mel frames × 256 hop = 1,536 samples = **0.096 seconds**.
+
+#### Frame Quality Analysis
+
+With the attention padding mask applied:
+
+**valid-frames:**
+
+- Pre-attention CNNs: clean. The last ~26 mel frames reach into silent-addon, but addon is natural trailing silence.
+- Attention: sees only valid-frames + addon-frames (padded-frames masked out). Clean.
+- Post-attention convolutions: the last ~3 frames mix with addon-frames, which have valid attention context. Clean.
+- **Result: fully clean.**
+
+**addon-frames:**
+
+- Pre-attention CNNs: features of silence, with CNN receptive field reaching valid-audio on one side and silent-padded on the other.
+- Attention: attend freely to valid-frames and other addon-frames. Have proper cross-position context.
+- Post-attention convolutions: the last ~3 addon-frames (0.096s) are contaminated by padded-frames, which have stale representations (masked from attention).
+- **Result: mostly clean. Last ~0.096s has minor contamination from padded-frames.**
+
+**padded-frames:**
+
+- Pre-attention CNNs: features of silence.
+- Attention: masked out — no cross-position context.
+- Post-attention convolutions: stale representations mixing with addon-frames.
+- **Result: discarded after encoding. Not used.**
+
+#### Mitigating Addon-Frame Contamination (Option B)
+
+The last ~3 addon-frames are contaminated because post-attention convolutions mix in padded-frames that lack attention context. Fix: extend the attention mask by a small buffer (~3 frames) beyond the truncation point:
+
+```
+Attention unmasked region: valid-frames + addon-frames + 3 buffer frames
+Truncation point:          valid-frames + addon-frames (buffer discarded)
+```
+
+The buffer frames participate in attention (receiving proper context), so when post-attention convolutions mix them into the last addon-frames, the contamination is "silence with valid attention context" rather than "silence with no context." The remaining imperfection is only CNN-level silence features, which is natural and harmless.
+
+#### Expected Impact
+
+- Encoder calls/step/GPU: ~30 → 1
+- Encoding time variance across ranks: High → Low
+- Step-time spikes from stragglers: Frequent, worsening → Largely eliminated
+
+#### Status
+
+- Compile fix: applied and deployed (2026-04-14)
+- Batched encoding: design complete, implementation pending
