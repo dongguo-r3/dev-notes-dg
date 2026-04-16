@@ -608,3 +608,265 @@ To add a `gpu-audio-metadata` variant:
 2. Add `RUN uv pip install librosa audiobox-aesthetics panns-inference soxr`
 3. Add to CI workflow matrix in `.github/workflows/ci-lax-docker.yaml`
 4. Use `--image` flag when creating Ray clusters: `flytecli ray-cluster --name my-cluster --image <new-image>`
+
+---
+
+## KubeRay Cluster Image Notes (2026-04-15)
+
+### Image Comparison: `gpu-08c77f73` vs `gpu-63d5cafd`
+
+Two OCIR Phoenix images used across omniva-flyte clusters:
+
+- **`gpu-08c77f73`** — Old "ecr-gpu-stable" image, pinned 2026-02-20 (PR #5764). Ray 2.50.0, no hplv.
+- **`gpu-63d5cafd`** — Current `ocir-phx-gpu-ray2_54-vllm0_14-hplv` image, built 2026-04-02 (PR #7011). Ray 2.54.0, vLLM 0.14.1, hplv >= 1.0.39, hplv-native >= 1.0.52.
+
+| Attribute | `gpu-08c77f73` | `gpu-63d5cafd` |
+|---|---|---|
+| Ray version | 2.50.0 | 2.54.0 |
+| vLLM version | older | 0.14.1 |
+| hplv | not included | >= 1.0.39 |
+| Image age | Feb 20 | Apr 2 |
+
+### Image Source of Truth
+
+All image tags are defined in `lib/lax-images/images.yaml`. Key entries for KubeRay clusters:
+
+- `ecr-gpu-ray2_54-vllm0_14-hplv` → `808558726171.dkr.ecr.ap-southeast-2.amazonaws.com/lax:gpu-73cf19e3` (kiwi-flyte)
+- `ocir-phx-gpu-ray2_54-vllm0_14-hplv` → `phx.ocir.io/axsgshhbf0lb/lax:gpu-63d5cafd` (omniva-flyte)
+
+### Image vs Application Code
+
+The image provides the **base environment** (Ray, vLLM, system libs, pip packages). When using `submit_ray_job`, your local `projects/lax/` directory is uploaded as a working directory overlay, so the **latest application code** runs regardless of what's baked into the image.
+
+To use a specific image: `flytecli ray-cluster --name my-cluster --image <image-uri>`
+
+### Cluster Inventory (2026-04-15)
+
+**vibevoice-omniva-s0..s7** (old image `gpu-08c77f73`, created 2026-03-30):
+- Head: ~307Gi memory, ~1031Gi worker object store (64%, older flytecli proportions)
+- Used for fidelity `en50m_nonen50m` processing (all 8 partitions completed)
+
+**metadata-s0..s7** (latest image `gpu-63d5cafd`, created 2026-04-15):
+- Head: 256Gi memory, ~128Gi object store (50%)
+- Worker: 88 CPUs, 8 GPUs, 1600Gi, ~515Gi object store (30%)
+- Ready and idle, awaiting next workload
+
+**metadata-s8** (old image `gpu-08c77f73`, created 2026-04-15):
+- Same config as metadata-s0..s7 but using the old image for A/B comparison
+- CR: `dongguo-metadata-s8-0e7583`
+
+---
+
+## 2026-04-15: Image A/B Test — gpu-63d5cafd vs gpu-08c77f73
+
+### Goal
+
+Compare the two omniva Docker images on the same fidelity pipeline workload to determine if the newer image (Ray 2.54, hplv) has any performance difference vs the older one (Ray 2.50, no hplv).
+
+### Setup
+
+- **Cluster A** (new image): `dongguo-metadata-s7-ffd6fc` — `gpu-63d5cafd` (Ray 2.54.0, vLLM 0.14.1, hplv)
+- **Cluster B** (old image): `dongguo-metadata-s8-0e7583` — `gpu-08c77f73` (Ray 2.50.0, no hplv)
+- Both clusters: 1 worker (88 CPUs, 8 GPUs, 1600Gi), head 256Gi, omniva-flyte
+- Same source table, same partition (0,4,1 = 25% of table), same application code overlay
+
+### Jobs
+
+- **Job A** (new image): `raysubmit_xPbtRc7btXTGn7s8`
+  - Destination: `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/fidelity_en50m_nonen50m_testrun_img_gpu-63d5cafd.lance`
+- **Job B** (old image): `raysubmit_r6zUQirQPdzxVuyx`
+  - Destination: `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/fidelity_en50m_nonen50m_testrun_img_gpu-08c77f73.lance`
+
+### Scripts
+
+```bash
+cd /Users/dongguo/Projects/lumaverse/projects/lax
+
+LAX_PYTHON=".venv/bin/python"
+DATA_API_URL="https://b0b7c37fc317-data-api-staging.sydney3.labs.lumalabs.ai"
+SOURCE="s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__en50m_nonen50m_compacted.lance"
+PIPELINE="lax.projects.av_data_processing.audio.audio_metadata.fidelity_pipeline.run_fidelity_pipeline_gpu"
+RUNTIME_ENV="lax/projects/av_data_processing/audio/audio_metadata/runtime_env.json"
+
+source ../../projects/lax/scripts/setup-ray-proxy.sh omniva-flyte "dongguo-metadata-s7-ffd6fc" <<< "n" > /dev/null 2>&1
+
+# Test 1: New image (gpu-63d5cafd) on metadata-s7
+$LAX_PYTHON -m lax.scripts.submit_ray_job --no-wait \
+  --ray-address "${DATA_API_URL}/api/v1/ray-proxy/omniva-flyte/dongguo-metadata-s7-ffd6fc" \
+  --source_uri "${SOURCE}" \
+  --destination_uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/fidelity_en50m_nonen50m_testrun_img_gpu-63d5cafd.lance" \
+  --pipeline_config "${PIPELINE}" \
+  --pipeline_params '{"audio_key": "audio_bytes"}' \
+  --no-randomized \
+  --runtime-env "${RUNTIME_ENV}" \
+  --partitions_range "0,4,1"
+
+# Test 2: Old image (gpu-08c77f73) on metadata-s8
+$LAX_PYTHON -m lax.scripts.submit_ray_job --no-wait \
+  --ray-address "${DATA_API_URL}/api/v1/ray-proxy/omniva-flyte/dongguo-metadata-s8-0e7583" \
+  --source_uri "${SOURCE}" \
+  --destination_uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/fidelity_en50m_nonen50m_testrun_img_gpu-08c77f73.lance" \
+  --pipeline_config "${PIPELINE}" \
+  --pipeline_params '{"audio_key": "audio_bytes"}' \
+  --no-randomized \
+  --runtime-env "${RUNTIME_ENV}" \
+  --partitions_range "0,4,1"
+```
+
+### Expectation
+
+The fidelity pipeline is not heavy on Ray-specific features (no hplv usage, no vLLM), so we expect **similar performance** between the two images. The main variable is Ray 2.50 vs 2.54 — any difference would come from Ray Data scheduling improvements in 2.54.
+
+### Results
+
+- **Job A** (gpu-63d5cafd): TBD
+- **Job B** (gpu-08c77f73): TBD
+
+---
+
+## 2026-04-16: VibeVoice ASR — SFT Tables (Group 62)
+
+### Goal
+
+Run VibeVoice ASR on 5 SFT lance tables (table-2 through table-6 from the internal dashboard group 62) to produce vibevoice transcripts alongside existing WhisperX transcripts. Table-1 (americanrhetoric, 28K rows) is skipped for now due to small size.
+
+### Source Tables
+
+| Table | Dataset | Source URI | Rows | Fragments |
+|-------|---------|-----------|------|-----------|
+| table-2 | hours_140k | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/hours_140k/asr/prefiltered_english__whisperx.lance` | 21,745,714 | 5,381 |
+| table-3 | convspeech | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/convspeech/asr/prefiltered_english__whisperx.lance` | 6,514,097 | 1,614 |
+| table-4 | podcast p11-14 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p11to14_whisperx_clean.lance` | 7,499,644 | 1,858 |
+| table-5 | podcast p14-17 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p14to17_whisperx_clean.lance` | 7,670,431 | 1,902 |
+| table-6 | podcast p17-20 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p17to20_whisperx_wild.lance` | 22,655,625 | 5,606 |
+
+All tables share the same schema: `audio_bytes` (list\<binary\>), `audio_path`, `sample_rate`, `language`, `segment_start`, `segment_end`, `segment_duration`, `whisperx_asr_content`, `whisperx_timestamp`, `num_speakers`, `total_speakers_in_file`, `lufs_gain_db`, `snr_db`, `speech_ratio`, `avg_word_score`, `overlap_ratio`, `original_row_id`.
+
+### Cluster & Partition Plan
+
+9 omniva Ray clusters (`vibevoice-omniva-s0` through `vibevoice-omniva-s8`), each with 1 worker node (8 GPUs). The two largest tables (table-2 and table-6) are split into 3 partitions each by fragment range.
+
+| Cluster | Source Table | Partition | Fragment Range | Dest URI |
+|---------|-------------|-----------|----------------|----------|
+| s0 | hours_140k | p1of3 | 0–1793 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p1of3.lance` |
+| s1 | hours_140k | p2of3 | 1793–3586 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p2of3.lance` |
+| s2 | hours_140k | p3of3 | 3586–5381 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p3of3.lance` |
+| s3 | convspeech | all | all 1,614 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/convspeech_vibevoice_asr.lance` |
+| s4 | podcast p11-14 | all | all 1,858 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p11to14_vibevoice_asr.lance` |
+| s5 | podcast p14-17 | all | all 1,902 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p14to17_vibevoice_asr.lance` |
+| s6 | podcast p17-20 | p1of3 | 0–1868 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p1of3.lance` |
+| s7 | podcast p17-20 | p2of3 | 1868–3736 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p2of3.lance` |
+| s8 | podcast p17-20 | p3of3 | 3736–5606 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p3of3.lance` |
+
+Naming convention: replace `whisperx` with `vibevoice_asr` in the source name, add `_p{i}of3` suffix for split tables.
+
+### Pipeline
+
+- **Pipeline**: `lax.projects.av_data_processing.audio.asr_vibevoice.pipeline_vllm.run_vibevoice_asr_vllm_pipeline`
+- **Model**: VibeVoice-ASR (7B, Qwen2.5-7B backbone) — joint ASR + speaker diarization + timestamps
+- **Output schema**: `segments` (JSON), `raw_text`, `num_speakers`, `num_segments`, `num_tokens`, `truncated`, `audio_duration_s`
+- **Throughput**: ~3.5 rows/s per GPU, ~28 rows/s per 8-GPU node
+
+### Cluster CR Names
+
+| Cluster | CR Name |
+|---------|---------|
+| s0 | `dongguo-vibevoice-omniva-s0-b76d15` |
+| s1 | `dongguo-vibevoice-omniva-s1-502299` |
+| s2 | `dongguo-vibevoice-omniva-s2-dfb184` |
+| s3 | `dongguo-vibevoice-omniva-s3-9ec3db` |
+| s4 | `dongguo-vibevoice-omniva-s4-eef6d4` |
+| s5 | `dongguo-vibevoice-omniva-s5-2e0b2e` |
+| s6 | `dongguo-vibevoice-omniva-s6-fecd96` |
+| s7 | `dongguo-vibevoice-omniva-s7-8c00e1` |
+| s8 | `dongguo-vibevoice-omniva-s8-23eb17` |
+
+### Launch Script
+
+Script: `/Users/dongguo/Projects/adhoc/audio_caption/launch_vibevoice_asr_9jobs.sh`
+
+```bash
+# Launch all 9 jobs
+bash launch_vibevoice_asr_9jobs.sh
+
+# Launch specific clusters
+bash launch_vibevoice_asr_9jobs.sh 3 4 5
+
+# Launch single cluster
+bash launch_vibevoice_asr_9jobs.sh 0
+```
+
+Each job runs:
+
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte <CR_NAME>
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --source_uri <SOURCE> \
+    --destination_uri <DEST> \
+    --pipeline_config lax.projects.av_data_processing.audio.asr_vibevoice.pipeline_vllm.run_vibevoice_asr_vllm_pipeline \
+    --disable-tracking true \
+    -u dongguo \
+    [--partitions_range "START,END,1"]  # only for split tables
+```
+
+### Job IDs
+
+**Attempt 1** (2026-04-16 00:11 PDT) — FAILED: missing `--runtime-env`, `No module named 'vibevoice'`.
+
+| Cluster | Job ID (failed) |
+|---------|--------|
+| s0–s8 | `raysubmit_iHCsH5FRHk538s6A`, `raysubmit_9CNmrPKV3pf1LYbz`, `raysubmit_UyVXmv1dbrn2RSUF`, `raysubmit_vgNRejB8SffzYkwg`, `raysubmit_dxgqHvxjA4wR4PNj`, `raysubmit_UjU1SrS6VnzwLmT8`, `raysubmit_cr6n69K9L5MW92kW`, `raysubmit_GGabDwLh2HbdNAsH`, `raysubmit_73Wm6JGESBFx2AwC` |
+
+**Attempt 2** (2026-04-16 00:25 PDT) — with `--runtime-env runtime_env_local.json` (real HF_TOKEN, not placeholder).
+
+| Cluster | Dataset | Job ID |
+|---------|---------|--------|
+| s0 | hours_140k p1of3 | `raysubmit_dViV4vn2ENARrBUB` |
+| s1 | hours_140k p2of3 | `raysubmit_7YWdaGekYDkkvPCS` |
+| s2 | hours_140k p3of3 | `raysubmit_gKaYz51UMCDxp54S` |
+| s3 | convspeech | `raysubmit_1dCMTYz6JywcHE13` |
+| s4 | podcast p11-14 | `raysubmit_sFwQKfbEUAtVFxae` |
+| s5 | podcast p14-17 | `raysubmit_aDDdJWmhedpKKfHc` |
+| s6 | podcast p17-20 p1of3 | `raysubmit_x8mt5a5Uv93ewuNC` |
+| s7 | podcast p17-20 p2of3 | `raysubmit_28MM1Kmrh4jqcSPE` |
+| s8 | podcast p17-20 p3of3 | `raysubmit_h1pkcgaBi6mXCBHk` |
+
+### Attempt History
+
+**Attempt 1** (00:11 PDT) — FAILED: missing `--runtime-env`, `No module named 'vibevoice'`.
+
+**Attempt 2** (00:25 PDT) — PARTIAL FAILURE: added `--runtime-env runtime_env_local.json`, but `partitions_range` format was wrong. Used `0,1793,1` (contiguous range) instead of `0,3,1` (modular). The format is `start_position,total,size` where fragments are selected by `fragment_index % total in [start, start+size)`. s0–s2 and s6–s8 processed only ~3 fragments each (~16K rows) and exited. s3/s4/s5 (no partitions) were unaffected.
+
+**Attempt 3** (00:41 PDT) — Resubmitted s0–s2 and s6–s8 with corrected partition ranges (`0,3,1` / `1,3,1` / `2,3,1`). Deleted stale output data before resubmission. s3/s4/s5 continued from attempt 2.
+
+| Cluster | Dataset | Attempt 3 Job ID |
+|---------|---------|-----------------|
+| s0 | hours_140k p1of3 | `raysubmit_gmPJG1hGBJiNfSyi` |
+| s1 | hours_140k p2of3 | `raysubmit_sRfGyqjmqPCxE1x3` |
+| s2 | hours_140k p3of3 | `raysubmit_T9L15MFHmDYa5TsD` |
+| s3 | convspeech | `raysubmit_1dCMTYz6JywcHE13` (from attempt 2) |
+| s4 | podcast p11-14 | `raysubmit_sFwQKfbEUAtVFxae` (from attempt 2) |
+| s5 | podcast p14-17 | `raysubmit_aDDdJWmhedpKKfHc` (from attempt 2) |
+| s6 | podcast p17-20 p1of3 | `raysubmit_87F1nYJGZsLPDrzA` |
+| s7 | podcast p17-20 p2of3 | `raysubmit_rVTvJyEutpn8uYR1` |
+| s8 | podcast p17-20 p3of3 | `raysubmit_r2RXzxTC8tLb3mfS` |
+
+### Key Lesson: `partitions_range` format
+
+The `--partitions_range` argument is `start_position,total,size` — NOT `start_fragment,end_fragment,step`. It uses modular arithmetic on fragment indices:
+
+```python
+for i in range(min(size, total - start)):
+    src_fragment_ids_.extend(src_fragment_ids[start + i :: total])
+```
+
+For a 3-way split: `0,3,1` / `1,3,1` / `2,3,1` (every 3rd fragment, offset by 0/1/2).
+
+### Status
+
+- [x] Create s8 cluster (`dongguo-vibevoice-omniva-s8-23eb17`)
+- [x] Launch all 9 jobs (attempt 3)
+- [x] Verified s3 output: 331K rows, 90.4% non-empty, real transcripts
+- [ ] All jobs complete
+- [ ] Verify final outputs
