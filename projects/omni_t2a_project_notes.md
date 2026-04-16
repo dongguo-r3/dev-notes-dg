@@ -3646,4 +3646,311 @@ The buffer frames participate in attention (receiving proper context), so when p
 #### Status
 
 - Compile fix: applied and deployed (2026-04-14)
-- Batched encoding: design complete, implementation pending
+- Batched encoding: simplified version implemented (pad → batch encode → truncate, no attention mask), branch `dongguo/omni-t2a-v2-batched-encoding` preserves the full attention-masked design
+
+---
+
+## Sequence Structure and Special Tokens (2026-04-15)
+
+### Training Sample Structure
+
+For a sample with transcript "this is a demo text-to-speech transcript" and 5 seconds of audio (16kHz):
+
+```
+ Tokens                                                          Attn Mode   Loss
+ ──────────────────────────────────────────────────────────────   ─────────   ────
+ <|im_start|>                                                    causal      no
+ user↵Speak the following transcript:↵                           causal      no
+ this is a demo text-to-speech transcript                        causal      no
+ <|im_end|>                                                      causal      no
+
+ <|im_start|>                                                    causal      no
+ assistant↵                                                      causal      no
+ <|im_end|>                                                      causal      CE ✓ (transition to generation)
+
+ <|image_pad|> × 157                                             noise       diffusion MSE ✓
+```
+
+Audio token count: `ceil(80000 samples / 512 hop) = 157 tokens`.
+
+Approximate total: ~20 text tokens + 157 audio tokens ≈ 177 tokens per sample. With `max_num_tokens=8000`, roughly 45 such 5-second samples can be packed into one sequence.
+
+### Qwen3 Special Tokens
+
+Available tokens from the Qwen3 vocabulary (`omni_constants.py`):
+
+| Token | ID | Current Usage |
+|---|---|---|
+| `<\|im_start\|>` | 151644 | Wraps text elements (chat turn start) |
+| `<\|im_end\|>` | 151645 | Closes text elements (chat turn end) |
+| `<\|vision_start\|>` | 151652 | Marks start of vision generation (T2I) |
+| `<\|vision_end\|>` | 151653 | Marks end of vision generation (T2I) |
+| `<\|image_pad\|>` | 151655 | Placeholder for image/audio VAE tokens |
+| `<\|video_pad\|>` | 151656 | Placeholder for video tokens |
+
+T2A currently reuses `<|image_pad|>` for audio tokens. No dedicated `<|audio_start|>`, `<|audio_end|>`, or `<|audio_pad|>` exists in the Qwen3 vocabulary. For future audio-video generation, adding dedicated audio special tokens would be cleaner.
+
+### Key Design Notes
+
+**`<|image_pad|>` is only a placeholder.** The token ID is never embedded through the Qwen3 text embedding table. It serves two purposes: (1) token counting for packing, (2) position tracking via `vae_token_mask` to route those positions to the generation stream (stream 1) where the actual input is MMAudio latents projected through `AudioPreprocess.embedding`.
+
+**CE loss on `<|im_end|>` tokens.** The `supervise_last_text_token=True` flag applies CE loss to the last non-padding token of each text element. Currently both `<|im_end|>` tokens are supervised. The first (after user prompt) is unnecessary — it always predicts a fixed template token `<|im_start|>`. Only the second (after "assistant\n") is meaningful — it's the transition point where the model switches from text to generation. With frozen text stream (current PoC), neither has gradient effect.
+
+**Prompt template** is defined in `OmniT2AAudio` (`lib/koba/koba/pipelines/default_t2a.py`):
+- Element 0: `"user\nSpeak the following transcript:\n{transcript}"` (no loss)
+- Element 1: `"assistant\n"` (no loss, except last token)
+- Element 2: audio latent tokens (diffusion loss)
+
+### Comparison: How T2I Determines Output Size
+
+In Omni T2I, the target image resolution is **specified by the caller**, not predicted by the model. The inference pipeline (`generate_modality_disaggregated.py`) receives a target shape (e.g., 512×768), computes latent dimensions (`latent_h=32, latent_w=48`), and allocates exactly `latent_h × latent_w = 1536` tokens for diffusion. The text stream provides semantic conditioning (what to generate) but never decides output dimensions.
+
+The generation block is predetermined: `[<|vision_start|>, <|image_pad|> × N, <|vision_end|>]`, all processed together through the diffusion loop. The `<|vision_start|>` is not a dynamically predicted switch signal — it's part of a fixed decode block.
+
+This is a fundamental constraint of the current architecture: **the text stream and generation stream don't negotiate output dimensions at runtime.**
+
+### Audio Duration at Inference Time
+
+T2A has a key asymmetry with T2I: image resolution is a user preference (content-independent), but audio duration depends on the **content** — "Hello" is 0.5s, a paragraph is 15s. The user doesn't know the correct duration upfront.
+
+**Failure modes from duration mismatch:**
+
+- **Over-allocation** (20s for "hello world"): safe but wasteful. If trained with silence padding, the model produces speech + trailing silence. Trim post-hoc.
+- **Under-allocation** (5s for a long paragraph): hard failure. Speech is truncated mid-sentence — content is lost, output is incorrect.
+
+The asymmetry means the practical strategy should **bias toward over-allocation**: estimate duration with a margin, generate, trim silence.
+
+**Approaches to determine duration at inference:**
+
+1. **External duration estimator** — a lightweight model or heuristic (characters-per-second) predicts duration from the transcript. Fast, decoupled from the generation model.
+2. **Planning tokens** — unfreeze the text stream, train it to generate planning text that includes a duration estimate (e.g., "Duration: 3.2 seconds"). The inference pipeline parses this and sets the token count. Most principled, aligns with future audio-video planning architecture.
+3. **Generous upper bound + trim** — always allocate a large budget (e.g., 15s), trim trailing silence post-hoc. Wastes compute but requires no duration prediction. Viable as a PoC baseline.
+4. **Duration tag in prompt** — at training time, include ground truth duration. At inference time, the user provides an estimate. Works for controlled TTS but doesn't solve the general case.
+
+For the PoC, option 3 or 4 is simplest. For production, option 2 is the cleanest — the model itself learns to predict duration as part of the planning phase.
+
+---
+
+## OmniElementAudio Token Mask Design (2026-04-15)
+
+### Background: MoT Dual-Stream Architecture
+
+The Omni model has two streams:
+
+- **Stream 0 (understanding)**: text tokens + ViT tokens. Causal attention.
+- **Stream 1 (generation)**: VAE latent tokens (images or audio). Noise attention (bidirectional within sample, invisible to text).
+
+Each token must be routed to the correct stream via boolean masks on `TokenizedSequenceElement`. The masks are set by `OmniElementAudio` (`lib/koba/koba/processor/omni_audio_ops.py`) for audio and by `OmniElementVAEImage` (`lib/koba_shared/koba_shared/processor/omni_vae_ops.py`) for images.
+
+### Token Mask Fields
+
+For an audio element with `N` tokens:
+
+| Field | Value | Meaning |
+|---|---|---|
+| `audio_token_mask` | `ones(N)` | All positions are audio content |
+| `text_token_mask` | `zeros(N)` | Not in understanding stream (stream 0) |
+| `vae_token_mask` | `ones(N)` | In generation stream (stream 1) — receives diffusion modulation |
+| `vit_token_mask` | `zeros(N)` | Not ViT tokens |
+| `clean_vae_img_mask` | `False` | Not a clean (unnoised) VAE image |
+| `clean_vae_token_mask` | `zeros(N)` | No clean tokens — all are denoising targets |
+| `noisy_vae_token_mask` | `ones(N)` | All tokens are noisy (being denoised) |
+| `padding_mask` | `ones(N)` | All real tokens (no padding within element) |
+| `txt_loss_mask` | `zeros(N)` | No CE loss — audio gets diffusion MSE loss instead |
+| `attention_mode` | `"noise"` | Bidirectional within sample; text cannot see audio |
+| `x_vae_by_modality` | `"t2a"` | Modality tag for sigma shift lookup in loss function |
+
+### Comparison with T2I (NOISY_VAE_IMAGE)
+
+T2I images have boundary tokens (`<|vision_start|>`, `<|vision_end|>`) and optional register tokens that are part of the text stream. Audio has no boundary tokens — all tokens are pure VAE content.
+
+| Field | T2I NOISY_VAE_IMAGE | T2A AUDIO | Why different |
+|---|---|---|---|
+| `vae_token_mask` | `ones`, `[0]=0`, `[-1]=0` | `ones` | T2I boundary tokens are text, not VAE |
+| `text_token_mask` | `zeros`, `[0]=1`, `[-1]=1` | `zeros` | T2I boundary tokens are text |
+| `noisy_vae_token_mask` | `ones`, `[0]=0`, `[-1]=0`, registers=0 | `ones` | No boundary/register tokens in audio |
+| `attention_mode` | `"noise"` | `"noise"` | Same — generation stream uses noise attention |
+| `txt_loss_mask` | `zeros` | `zeros` | Same — VAE tokens don't get CE loss |
+
+### Bug Fixes from Main Branch
+
+The original `OmniElementAudio` on main had incorrect scaffolding defaults. All existing Omni T2A training runs on this branch use the corrected values:
+
+| Field | Main (broken) | Fixed | Impact if wrong |
+|---|---|---|---|
+| `vae_token_mask` | `zeros` | `ones` | Audio not routed to generation stream — model can't denoise |
+| `txt_loss_mask` | `ones` | `zeros` | CE loss on audio positions — nonsensical gradients |
+| `attention_mode` | `"full"` | `"noise"` | Text attends to audio — breaks asymmetric attention |
+| `audio_pad_token` | `"<\|audio_pad\|>"` | `"<\|image_pad\|>"` | Nonexistent token — tokenizer error |
+
+### Audio Position ID Strategy
+
+Added configurable `audio_position_mode` on `OmniPositionIDMRoPE.Config` (`lib/koba_shared/koba_shared/processor/position_ids_dev.py`):
+
+- **`"meshgrid"` (default)**: Position IDs `[t, 0, 0]` — temporal increments, spatial fixed at 0. Treats audio as a 1D temporal sequence with no spatial extent. This is the original main branch logic.
+- **`"text_like"`**: Position IDs `[t, t, t]` — all 3 MRoPE coordinates share the same index, matching the convention used by text tokens.
+
+Both are valid for training from scratch. `"meshgrid"` is semantically more precise (audio has no spatial structure). `"text_like"` matches how the pretrained Qwen3 text stream encodes 1D sequences.
+
+---
+
+## Experiment Config: Padded Softcap (2026-04-15)
+
+Config function: `exp_0_6b_mmaudio_formal_koba_v2_single_shift_softcap_padded`
+
+Key settings:
+
+- `pad_duration_ceil_sec=5.0` — audio padded to next multiple of 5s
+- `max_num_tokens=16000` — increased to accommodate padded audio
+- `num_workers=12, prefetch_factor=4` — background data loading
+- FlexAttention compiled via `SimplyCallApplyCompile`
+- MMAudio encoding: one-by-one (sequential, `batched_audio_encoding=False`)
+
+### Hyperparameter Comparison: Omni T2A (Padded) vs Ray3 T2A (stage001_internal_audio_v2)
+
+| Hyperparameter | Omni T2A (padded) | Ray3 T2A (stage001) | Match? |
+|---|---|---|---|
+| **Model** | Qwen3 0.6B dual-stream MMDiT (~300M trainable) | Ray3 2.9B DiT | Different |
+| **Text conditioning** | Frozen Qwen3-0.6B packed self-attention | UMT5-XXL cross-attention | Different |
+| **VAE** | MMAudio 16k, 20-dim latents | MMAudio 16k, 20-dim latents | Match |
+| **Latent scaling** | 1/2.3563 | 1/2.3563 | Match |
+| **Noise schedule** | TruncNormal(shift=-1.6, scale=1.0) | TruncNormal(shift=-1.6, scale=1.0) | Match |
+| **Sigma shift** | 1.0 (no-op) | N/A (no sigma remapping) | Match |
+| **Loss** | Rectified flow, v-prediction, MSE | Rectified flow, v-prediction, MSE | Match |
+| **Diffusion loss weight** | 1.0 | 1.0 | Match |
+| **Optimizer** | AdamW | AdamW | Match |
+| **LR** | 2e-5 | 1e-4 | Different |
+| **Weight decay** | 0.01 | 0.01 | Match |
+| **Betas** | (0.9, 0.95) | (0.9, 0.95) | Match |
+| **Eps** | 1e-8 | 1e-8 | Match |
+| **LR warmup** | 500 steps | 5,000 steps | Different |
+| **Grad clip** | 1.0 | None | Different |
+| **Softcap** | cap=1.0 on audio stream | None | Different |
+| **CFG dropout** | 0.1 | 0.1 (uncond_prob on UMT5-XXL) | Match |
+| **Sample rate** | 16,000 Hz | 16,000 Hz | Match |
+| **Peak normalize** | True (headroom=1.1, ~0.91) | True (peak_threshold=0.9) | ~Match |
+| **Clamp** | True | True | Match |
+| **RMS normalization** | None | None | Match |
+| **Dataset** | internal-audio-v2-english (~124M rows) | internal-audio-v2 (~142M, multilingual) | Different |
+| **Duration handling** | pad_duration_ceil_sec=5.0 | Duration buckets [5.04, 10.04, 15.04] | Similar |
+| **Max tokens (packed)** | 16,000 | N/A (batch of 32 per bucket) | Different arch |
+| **Batch size** | 32 (packing batch_size) | [32, 16, 8] per bucket | Similar |
+| **Num workers** | 12 | 12 | Match |
+| **Compiler** | SimplyCallApplyCompile | N/A (Ray3 compile path) | — |
+| **FSDP** | GenericTransformerHSDP2, intra_node=8 | dp_shard=32 | Different |
+| **Nodes** | 4 (32 GPUs) | 16 (128 GPUs) | Different |
+| **Save every** | 1,000 steps | 5,000 steps | Different |
+| **Max steps** | 1,000,000 | 1,000,000 | Match |
+
+Intentional differences (not bugs):
+
+- **LR 2e-5 vs 1e-4**: Omni trains ~300M params (audio stream only), Ray3 trains 2.9B.
+- **Warmup 500 vs 5000**: Shorter warmup for the smaller model.
+- **Softcap + grad clip**: Omni-specific training stabilization.
+- **English-only dataset**: Simpler for PoC.
+- **Fewer nodes**: Omni model is 5x smaller, needs fewer GPUs.
+
+---
+
+## Demo Inference Plan (2026-04-15)
+
+### Run Details
+
+- **WandB run**: [osku2pzw](https://wandb.ai/luma-ai/omni-t2a/runs/osku2pzw) — `dongguo/omni_t2a_single_shift_softcap_compiled`
+- **Config**: `exp_0_6b_mmaudio_formal_koba_v2_single_shift_softcap`
+- **Checkpoint**: Step 19K (merged from 8 HSDP shards → single .pt)
+- **Checkpoint path**: `/fsx/dongguo/adhoc/omni-t2a/inference/osku2pzw_19K/ckpts/merged/checkpoint.pt`
+- **Remote source**: `s3://ai-lumalabs-checkpoints-ap-se-2/dongguo/dongguo/omni_t2a_single_shift_softcap_compiled/00019000/`
+
+### Eval Prompt Set
+
+30 speech transcripts from `projects/kuma/kuma/projects/quantum4/prompts/t2a/prompts_speech_tag.txt`, with `<speech>` tags stripped. Referred to as `sample_0` through `sample_29`.
+
+### Job Matrix
+
+- **30 prompts** × **3 durations** × **3 seeds** = **270 jobs**
+
+| Duration | Audio frames (16kHz) | Audio latent tokens (÷512) |
+|---|---|---|
+| 5.0s | 80,000 | 157 |
+| 7.5s | 120,000 | 235 |
+| 10.0s | 160,000 | 313 |
+
+Seeds: 42, 123, 456
+
+### Duration Control Mechanism
+
+The duration of the generated audio is controlled entirely by the **number of audio latent tokens** in the initial noise tensor:
+
+```
+num_audio_tokens = ceil(duration_sec × sample_rate / compression_factor)
+                 = ceil(duration_sec × 16000 / 512)
+```
+
+This determines:
+
+1. The number of audio placeholder tokens in the sequence plan (via `get_sequence_plan_t2a(duration_sec=...)`)
+2. The shape of the initial noise: `x_init ~ N(0, I)` with shape `(1, num_audio_tokens, 20)`
+3. The model denoises exactly `num_audio_tokens` tokens over 50 Euler steps
+4. The MMAudio decoder converts latents to a waveform, which is cropped to `duration × sample_rate` samples
+
+### Inference Parameters (Training-Consistent)
+
+| Parameter | Value | Rationale |
+|---|---|---|
+| schedule_shift | 0.0 | Training sigma_shift=1.0 → -2×log(1) = 0 |
+| softcap | 1.0 | Matches `_apply_softcap(job, cap=1.0)` |
+| cfg_scale | 3.5 | Training used cfg_dropout=0.1 |
+| num_steps | 50 | Standard for rectified flow |
+| eta | 0.0 | Deterministic Euler/DDIM |
+| task_prompt | `user\nSpeak the following transcript:\n` | Matches `default_t2a.py` training format |
+| assistant_prefix | `assistant\n` | Matches `default_t2a.py` training format |
+
+### Prompt Format (Must Match Training)
+
+Training uses the koba T2A pipeline (`lib/koba/koba/pipelines/default_t2a.py`), which formats each sample as:
+
+```
+[TEXT("user\nSpeak the following transcript:\n" + transcript)]
+[TEXT("assistant\n")]
+[AUDIO(latent_tokens)]
+```
+
+At inference, the same structure is reproduced via `build_t2a_batch(task_prompt=..., assistant_prefix=...)`.
+
+### GPU Allocation Strategy
+
+**Single-process-per-GPU** — each GPU loads the model once, compiles once with `torch.compile(backend="inductor")`, then iterates all assigned jobs sequentially. This avoids I/O contention from multi-process checkpoint loading.
+
+**Grouped by duration** to minimize `torch.compile` recompilation (different durations → different sequence lengths → different compiled graphs):
+
+| GPUs | Duration | Jobs | Jobs/GPU |
+|---|---|---|---|
+| 0, 1, 2 | 5.0s | 90 | 30 |
+| 3, 4, 5 | 7.5s | 90 | 30 |
+| 6, 7 | 10.0s | 90 | 45 |
+
+### Output Structure
+
+```
+/fsx/dongguo/adhoc/omni-t2a/inference/osku2pzw_19K/demos/chat_fmt/
+├── 5s/
+│   ├── sample_0/
+│   │   ├── seed_42/generated_audio.wav
+│   │   ├── seed_123/generated_audio.wav
+│   │   └── seed_456/generated_audio.wav
+│   ├── sample_1/
+│   │   └── ...
+│   └── sample_29/
+├── 7.5s/
+│   └── (same structure)
+└── 10s/
+    └── (same structure)
+```
+
+### Known Issues & Notes
+
+- **flex_attention without torch.compile** is extremely slow (~0.87s/step vs expected ~0.05s/step). The unfused implementation materializes the full attention matrix on CPU.
+- **torch.compile** reduces per-step time but triggers recompilation when sequence length changes (hence grouping by duration).
+- **I/O contention**: Running 8 processes that each load a 2.6 GB checkpoint saturates FSx bandwidth. The single-process-per-GPU approach avoids this.
+- **schedule_shift mismatch**: The default `get_t2a_inference_params()` returns `schedule_shift=-2×log(3)` (for sigma_shift=3.0), which is **wrong** for this experiment (sigma_shift=1.0). Must explicitly set `schedule_shift=0.0`.
