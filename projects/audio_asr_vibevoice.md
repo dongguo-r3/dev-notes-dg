@@ -1,7 +1,17 @@
 # VibeVoice ASR — podcast_10m Status
 
-Source: `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance`  
-Total rows: 221,842,325 across 16 partitions  
+> **What this note is for:** Tracking the VibeVoice ASR v2 run over the `podcast_10m` multilingual dataset (221M rows, 16 partitions). Logs partition status, active job IDs, cluster assignments, and analysis dashboards.
+>
+> | Metric | Value |
+> |---|---|
+> | Total rows | 221,842,325 (16 partitions) |
+> | As of 2026-04-06 | **13/16 complete**, 3 running (p2, p6, p13) |
+> | Analysis dashboards | Uploaded 2026-04-07 to S3 (4 dashboards — see below) |
+
+---
+
+Source: `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance`
+Total rows: 221,842,325 across 16 partitions
 Output prefix: `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p{N}_16_1.lance`
 
 Pipeline: `lax.projects.av_data_processing.audio.asr_vibevoice.pipeline_vllm.run_vibevoice_asr_vllm_pipeline`  

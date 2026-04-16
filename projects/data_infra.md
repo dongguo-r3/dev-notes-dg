@@ -1,5 +1,13 @@
 # Data Infrastructure Notes
 
+> **What this note is for:** Concepts and mental models for lumaverse data infrastructure — Lance storage, Ray Data processing, and how they interact. Reference this when debugging pipeline behavior or reasoning about storage layout.
+>
+> - **Lance fragments:** storage unit for Lance datasets; too many fragments (e.g. 54K) causes slow randomized reads → use `--no-randomized` or compact first
+> - **Ray Data blocks:** processing unit; `Completed N/M` counts fully-flushed blocks, not rows; blocks and fragments are independent concepts
+> - **Fragment vs block mental model:** fragments = books on a shelf (storage); blocks = reading assignments (processing)
+
+---
+
 Technical notes on data storage, processing infrastructure, and pipeline concepts used in lumaverse.
 
 ---
