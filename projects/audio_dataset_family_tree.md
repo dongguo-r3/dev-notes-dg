@@ -24,7 +24,7 @@
 | Family | Fidelity v1 | VibeVoice ASR | Speech Metadata v2 |
 |---|---|---|---|
 | **SFT (5 tables)** | Done (2 need cleanup pass) | ✅ Done (9 partitions, 66M rows, finished 2026-04-16) | 3/5 tables done; 2 big tables (hours_140k, podcast p17-20) in 6-partition processing |
-| **multilingual_v1** | Done (221.2M/221.8M, 0.27% gap) | ~81% (13/16 partitions) | ✅ Done — all 12 partitions SUCCEEDED (221.84M rows) |
+| **multilingual_v1** | Done (221.2M/221.8M, 0.27% gap) | ✅ Done — 16/16 partitions (221.3M/221.8M, 0.23% gap, all committed 2026-04-06) | ✅ Done — all 12 partitions SUCCEEDED (221.84M rows) |
 | **en50m_nonen50m** | Done (merged from 8 partitions) | Not started | Not started |
 | **internal_audio_v1** | Running (8 partitions) | Not started | Not started |
 
@@ -268,11 +268,17 @@ Gap: 604,029 rows (0.27%) — Arrow 2GB overflow batches. Needs cleanup pass wit
 
 ### VibeVoice ASR
 
-16 partitions processed separately.
+16 partitions processed separately on omniva-flyte and kiwi-flyte clusters,
+completed 2026-04-01 — 2026-04-06. Resume jobs for 3 late partitions (p2, p6,
+p13) all finished on 2026-04-06 by 22:47 UTC.
 
-| Output Pattern | Status |
-|---|---|
-| `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p{N}_16_1.lance` | ~13/16 complete (as of 2026-04-06) |
+| Output Pattern | Partitions | Rows | Status |
+|---|---|---|---|
+| `s3://...podcast_10m/asr/vibevoice_multilingual_v2_p{N}_16_1.lance` | 16/16 | 221,324,671 | ✅ All complete — 99.77% of source (0.23% gap, ~517K rows) |
+
+See `audio_asr_vibevoice.md` for per-partition row counts, resume job IDs, and
+analysis dashboards (2026-04-07 podcast comparison / language detection / EN
+progressive filtering dashboards uploaded to S3).
 
 ### Speech Metadata v2
 

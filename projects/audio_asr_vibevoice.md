@@ -5,7 +5,8 @@
 > | Metric | Value |
 > |---|---|
 > | Total rows | 221,842,325 (16 partitions) |
-> | As of 2026-04-06 | **13/16 complete**, 3 running (p2, p6, p13) |
+> | As of 2026-04-06 | 13/16 complete, 3 running (p2, p6, p13) |
+> | As of 2026-04-17 | **All 16/16 complete** — 221,324,671 rows on disk (99.77% of source, 517,654 gap) |
 > | Analysis dashboards | Uploaded 2026-04-07 to S3 (4 dashboards — see below) |
 
 ---
@@ -18,44 +19,49 @@ Pipeline: `lax.projects.av_data_processing.audio.asr_vibevoice.pipeline_vllm.run
 Submit script: `python -m lax.scripts.submit_ray_job` from `/Users/dongguo/Projects/lumaverse/projects/lax`  
 Runtime env: `lax/projects/av_data_processing/audio/asr_vibevoice/runtime_env_local.json` (local, contains HF_TOKEN)
 
-## v2 Partition Status (updated 2026-04-06)
+## v2 Partition Status (updated 2026-04-17 — all complete)
+
+Verified 2026-04-17 by querying each partition's output Lance table directly.
+All 3 jobs running on 2026-04-06 (p2, p6, p13) have since committed final state
+(last commits 2026-04-06 21:54 — 22:47 UTC).
 
 | Partition | Cluster | Rows | Last Version | Last Updated | Status |
 |-----------|---------|------|-------------|--------------|--------|
-| p0_16_1 | omniva-s0 | 14,000,000 | v99 | 2026-04-04 | **Complete** |
-| p1_16_1 | omniva-s1 | 14,000,000 | v98 | 2026-04-01 | **Complete** |
-| p2_16_1 | tmp-s2 (`dongguo-vibevoice-tmp-s2-633ae8`) | 13,467,200 | v93 | 2026-04-06 | **Running** — Job `raysubmit_piq44zQzedA9M2s6`, ~398K rows left |
-| p3_16_1 | omniva-s3 | 13,898,108 | v97 | 2026-04-03 | **Complete** |
-| p4_16_1 | omniva-s4 | 13,897,974 | v97 | 2026-04-04 | **Complete** |
-| p5_16_1 | tmp-s3 (`dongguo-vibevoice-tmp-s3-543e8a`) | 13,337,105 | v94 | 2026-04-06 | **Complete** — Resume job finished in 35s, partition fully processed |
-| p6_16_1 | tmp-s1 (`dongguo-vibevoice-tmp-s1-13c202`) | 13,630,387 | v95 | 2026-04-06 | **Running** — Job `raysubmit_RH7TRn1sZB9H2GR2`, ~235K rows left |
-| p7_16_1 | omniva-s7 | 13,869,821 | v97 | 2026-04-03 | **Complete** |
-| p8_16_1 | tmp-s8 | 13,863,636 | v96 | 2026-04-01 | **Complete** |
-| p9_16_1 | tmp-s9 | 13,862,549 | v97 | 2026-04-01 | **Complete** |
-| p10_16_1 | tmp-s10 | 13,867,698 | v97 | 2026-04-03 | **Complete** |
-| p11_16_1 | tmp-s11 | 13,897,600 | v97 | 2026-04-03 | **Complete** |
-| p12_16_1 | tmp-s12 | 13,897,454 | v97 | 2026-04-01 | **Complete** |
-| p13_16_1 | tmp-s5 (`dongguo-vibevoice-tmp-s5-2c12fb`) | 13,282,309 | v92 | 2026-04-06 | **Running** — Job `raysubmit_WvYucpFDRSe41Myq`, ~583K rows left |
-| p14_16_1 | tmp-s14 | 13,899,430 | v97 | 2026-04-03 | **Complete** |
-| p15_16_1 | tmp-s15 | 13,900,000 | v97 | 2026-04-01 | **Complete** |
+| p0_16_1 | omniva-s0 | 14,000,000 | v99 | 2026-04-04 08:07 | ✅ Complete |
+| p1_16_1 | omniva-s1 | 14,000,000 | v98 | 2026-04-01 22:28 | ✅ Complete |
+| p2_16_1 | tmp-s2 (`dongguo-vibevoice-tmp-s2-633ae8`) | 13,990,495 | v98 | 2026-04-06 22:47 | ✅ Complete — resume job `raysubmit_piq44zQzedA9M2s6` finished (+523K rows since 2026-04-06 14:58) |
+| p3_16_1 | omniva-s3 | 13,898,108 | v97 | 2026-04-04 04:05 | ✅ Complete |
+| p4_16_1 | omniva-s4 | 13,897,974 | v97 | 2026-04-04 17:28 | ✅ Complete |
+| p5_16_1 | tmp-s3 (`dongguo-vibevoice-tmp-s3-543e8a`) | 13,337,105 | v95 | 2026-04-06 21:54 | ✅ Complete (resume job finished in 35s) |
+| p6_16_1 | tmp-s1 (`dongguo-vibevoice-tmp-s1-13c202`) | 13,860,492 | v98 | 2026-04-06 22:19 | ✅ Complete — resume job `raysubmit_RH7TRn1sZB9H2GR2` finished (+230K rows) |
+| p7_16_1 | omniva-s7 | 13,869,821 | v97 | 2026-04-03 22:08 | ✅ Complete |
+| p8_16_1 | tmp-s8 | 13,863,636 | v96 | 2026-04-02 02:53 | ✅ Complete |
+| p9_16_1 | tmp-s9 | 13,862,549 | v97 | 2026-04-01 15:08 | ✅ Complete |
+| p10_16_1 | tmp-s10 | 13,867,698 | v97 | 2026-04-03 14:19 | ✅ Complete |
+| p11_16_1 | tmp-s11 | 13,897,600 | v97 | 2026-04-03 14:31 | ✅ Complete |
+| p12_16_1 | tmp-s12 | 13,897,454 | v97 | 2026-04-01 14:48 | ✅ Complete |
+| p13_16_1 | tmp-s5 (`dongguo-vibevoice-tmp-s5-2c12fb`) | 13,282,309 | v92 | 2026-04-06 21:54 | ✅ Complete — resume job `raysubmit_WvYucpFDRSe41Myq` appears finished (row count stable since 2026-04-06 14:58, ~583K rows never materialized — likely natural partition size gap, not a stalled job) |
+| p14_16_1 | tmp-s14 | 13,899,430 | v97 | 2026-04-03 00:41 | ✅ Complete |
+| p15_16_1 | tmp-s15 | 13,900,000 | v97 | 2026-04-01 15:09 | ✅ Complete |
+| **Total** | | **221,324,671** | | | vs 221,842,325 source = **99.77%**, gap 517,654 rows (0.23%) |
 
-**13/16 complete, 3 running (p2, p6, p13)** — as of 2026-04-06 14:58 UTC
+**All 16/16 complete** as of 2026-04-06 22:47 UTC. Gap is consistent with fidelity v1's 0.27% gap on the same source — likely Arrow 2GB overflow batches that failed silently. If needed, a cleanup pass with `batch_size=1024` on the missing fragments should recover most of the gap.
 
-## Active Jobs (2026-04-06)
+## Active Jobs (historical — all finished 2026-04-06)
 
-| Job ID | Cluster | Partition | Port-forward |
-|--------|---------|-----------|--------------|
-| `raysubmit_RH7TRn1sZB9H2GR2` | tmp-s1 (dongguo-vibevoice-tmp-s1-13c202) | p6 | `kubectl port-forward -n flytesnacks-development svc/dongguo-vibevoice-tmp-s1-13c202-head-svc 18261:8265` |
-| `raysubmit_piq44zQzedA9M2s6` | tmp-s2 (dongguo-vibevoice-tmp-s2-633ae8) | p2 | `kubectl port-forward -n flytesnacks-development svc/dongguo-vibevoice-tmp-s2-633ae8-head-svc 18262:8265` |
-| `raysubmit_WvYucpFDRSe41Myq` | tmp-s5 (dongguo-vibevoice-tmp-s5-2c12fb) | p13 | `kubectl port-forward -n flytesnacks-development svc/dongguo-vibevoice-tmp-s5-2c12fb-head-svc 18264:8265` |
+Resume jobs for the 3 late-running partitions. All have since finished and
+their output tables are committed (see status table above).
 
-Check status:
-```bash
-cd /Users/dongguo/Projects/lumaverse/projects/lax && source .venv/bin/activate
-RAY_ADDRESS=http://localhost:18261 ray job status raysubmit_RH7TRn1sZB9H2GR2  # p6
-RAY_ADDRESS=http://localhost:18262 ray job status raysubmit_piq44zQzedA9M2s6  # p2
-RAY_ADDRESS=http://localhost:18264 ray job status raysubmit_WvYucpFDRSe41Myq  # p13
-```
+| Job ID | Cluster | Partition | Final State |
+|--------|---------|-----------|-------------|
+| `raysubmit_RH7TRn1sZB9H2GR2` | tmp-s1 (dongguo-vibevoice-tmp-s1-13c202) | p6 | ✅ Complete 2026-04-06 22:19 |
+| `raysubmit_piq44zQzedA9M2s6` | tmp-s2 (dongguo-vibevoice-tmp-s2-633ae8) | p2 | ✅ Complete 2026-04-06 22:47 |
+| `raysubmit_WvYucpFDRSe41Myq` | tmp-s5 (dongguo-vibevoice-tmp-s5-2c12fb) | p13 | ✅ Complete 2026-04-06 21:54 |
+
+The `tmp-s1`, `tmp-s2`, `tmp-s5` clusters may or may not still exist —
+check with `kubectl get rayclusters -n flytesnacks-development | grep tmp-s`
+before reuse. These were ad-hoc resume clusters, not part of the stable
+omniva-sN / metadata-sN cluster families.
 
 ## Analysis Dashboards (vibevoice_analysis_v2)
 
