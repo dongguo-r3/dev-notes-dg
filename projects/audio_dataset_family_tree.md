@@ -90,9 +90,16 @@ schema from the WhisperX ASR pipeline.
 
 #### Fidelity v1
 
-| Output | Rows | Gap | Status |
-|---|---|---|---|
-| `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/hours_140k/metadata/fidelity_prefiltered_english__whisperx_v1.lance` | 21,721,789 | 23,925 (0.11%) | Done — needs cleanup pass with `batch_size=1024` |
+Primary output plus 7 partition re-run intermediates (cleanup passes).
+
+| Output | Purpose |
+|---|---|
+| `s3://.../audio/sft/hours_140k/metadata/fidelity_prefiltered_english__whisperx_v1.lance` | **Primary output** — 21,721,789 rows (23,925 rows gap, 0.11%, needs further cleanup pass with `batch_size=1024`) |
+| `s3://.../metadata/fidelity_prefiltered_english__whisperx.lance` | Original (pre-`_v1` rename) |
+| `s3://.../metadata/fidelity_prefiltered_english__whisperx_p0.lance` | Initial p0 run (superseded by p0_re) |
+| `s3://.../metadata/fidelity_prefiltered_english__whisperx_p0_v2.lance` | p0 re-run v2 |
+| `s3://.../metadata/fidelity_prefiltered_english__whisperx_p1_v2.lance` | p1 re-run v2 |
+| `s3://.../metadata/fidelity_prefiltered_english__whisperx_p{0,1,2,3,4,5,6}_re.lance` (7 tables) | Partition re-runs for gap backfill (see fidelity STATUS.md for per-partition rows) |
 
 #### VibeVoice ASR
 
@@ -148,7 +155,8 @@ handles the combined writes and prevents duplicate rows via `original_row_id`.
 
 | Output | Cluster | Job ID | Status |
 |---|---|---|---|
-| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/metadata/sft/convspeech_speech_metadata.lance` | vibevoice-s1 | `raysubmit_paKM7EAr6EpCdjRZ` | ✅ SUCCEEDED (6.51M / 6.51M rows, 100%) |
+| `s3://.../dongguo/lax/metadata/sft/convspeech_speech_metadata.lance` | vibevoice-s1 | `raysubmit_paKM7EAr6EpCdjRZ` | ✅ SUCCEEDED (6.51M / 6.51M rows, 100%) |
+| `s3://.../dongguo/lax/metadata/sft/convspeech_speech_metadata_verify.lance` | vibevoice-s1 (early verify) | `raysubmit_V59zkuhHFUK6Pdj4` | Stopped after smoke test; safe to delete |
 
 ---
 
@@ -209,9 +217,14 @@ handles the combined writes and prevents duplicate rows via `original_row_id`.
 
 #### Fidelity v1
 
-| Output | Rows | Gap | Status |
-|---|---|---|---|
-| `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/metadata/fidelity_podcast_10m_p17to20_whisperx_wild_v1.lance` | 22,655,625 | 0 | Done |
+Primary output plus 10+ partition re-run intermediates (cleanup passes for initial gaps).
+
+| Output | Purpose |
+|---|---|
+| `s3://.../audio/sft/podcast_10m/metadata/fidelity_podcast_10m_p17to20_whisperx_wild_v1.lance` | **Primary output** — 22,655,625 rows (0 gap) |
+| `s3://.../metadata/fidelity_podcast_10m_p17to20_whisperx_wild.lance` | Original (pre-`_v1` rename) |
+| `s3://.../metadata/fidelity_podcast_10m_p17to20_whisperx_wild_p{0,1,2}.lance` (3 tables) | Initial partition runs (superseded by `_re` versions) |
+| `s3://.../metadata/fidelity_podcast_10m_p17to20_whisperx_wild_p{0,1,2,3,4,5,6}_re.lance` (7 tables) | Partition re-runs for gap backfill |
 
 #### VibeVoice ASR
 
@@ -257,24 +270,35 @@ large audio batches can hit the Arrow 2GB per-column limit.
 
 ### Fidelity v1
 
-Processed as 16 partitions, then merged. Fidelity filter scores also computed.
+Processed as 7 partition tables over multiple rounds (partitioning scheme evolved as throughput knowledge improved — `p{N}.lance` initial partitions, `p{N}_16_M.lance` later round-robin splits). All 7 merged into `_round1.lance`. Fidelity filter scores also computed.
 
-| Output | S3 URI | Rows | Status |
-|---|---|---|---|
-| **Fidelity (merged)** | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/fidelity_multilingual_v1_round1.lance` | 221,238,296 | Done |
-| **Fidelity Scores** | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/fidelity_multilingual_v1_round1_scores.lance` | 221,238,296 | Done |
+| Output S3 URI | Rows | Purpose |
+|---|---|---|
+| `s3://.../podcast_10m/metadata/fidelity_multilingual_v1_round1.lance` | **221,238,296** | **Primary output — merge of 7 partition tables below** |
+| `s3://.../podcast_10m/metadata/fidelity_multilingual_v1_round1_scores.lance` | 221,238,296 | Fidelity filter scores (re-applied to merged table) |
+| `s3://.../podcast_10m/metadata/fidelity_multilingual_v1_p0_16_2.lance` | 27,927,183 | Partition 0 (split-of-2 strategy) |
+| `s3://.../podcast_10m/metadata/fidelity_multilingual_v1_p2.lance` | 13,930,877 | Partition 2 (initial strategy) |
+| `s3://.../podcast_10m/metadata/fidelity_multilingual_v1_p3_16_1.lance` | 13,426,517 | Partition 3 |
+| `s3://.../podcast_10m/metadata/fidelity_multilingual_v1_p4_16_2.lance` | 27,235,079 | Partition 4 (split-of-2) |
+| `s3://.../podcast_10m/metadata/fidelity_multilingual_v1_p6_16_1.lance` | 13,860,492 | Partition 6 |
+| `s3://.../podcast_10m/metadata/fidelity_multilingual_v1_p7_16_1.lance` | 13,869,820 | Partition 7 |
+| `s3://.../podcast_10m/metadata/fidelity_multilingual_v1_p8_16_8.lance` | 110,988,328 | Partition 8 (split-of-8, largest) |
+| `s3://.../podcast_10m/metadata/fidelity_multilingual_v1_p{0,1,3}.lance` | superseded | Earlier 16_1 partition attempts (replaced by `_16_M.lance` split runs) |
+| `s3://.../podcast_10m/metadata/fidelity_multilingual_v1.lance` | (pre-round1 merge attempt) | Partially merged, superseded by `_round1.lance` |
+| `s3://.../podcast_10m/metadata/fidelity_multilingual_test_v3.lance` | (test) | Initial pipeline validation |
+| `s3://.../podcast_10m/metadata/fidelity_multilingual_v1_p0_test_*.lance` (4 tables) | (test) | Throughput-tuning experiments (batch_size, actors/GPU, reader S3) |
 
-Gap: 604,029 rows (0.27%) — Arrow 2GB overflow batches. Needs cleanup pass with `batch_size=1024`.
+Gap: 604,029 rows (0.27%) from Arrow 2GB overflow batches. Needs cleanup pass with `batch_size=1024`.
 
 ### VibeVoice ASR
 
-16 partitions processed separately on omniva-flyte and kiwi-flyte clusters,
-completed 2026-04-01 — 2026-04-06. Resume jobs for 3 late partitions (p2, p6,
-p13) all finished on 2026-04-06 by 22:47 UTC.
+Two runs: abandoned v1 (empty outputs from `HF_TOKEN` bug), and successful v2.
 
 | Output Pattern | Partitions | Rows | Status |
 |---|---|---|---|
-| `s3://...podcast_10m/asr/vibevoice_multilingual_v2_p{N}_16_1.lance` | 16/16 | 221,324,671 | ✅ All complete — 99.77% of source (0.23% gap, ~517K rows) |
+| `s3://...podcast_10m/asr/vibevoice_multilingual_v1_p{N}_16_1.lance` | p0-p5, p8-p15 (14 tables present) | 0 | ⚠️ Abandoned — `HF_TOKEN` not propagating to `ProcessPoolExecutor` workers; all outputs empty. Bug fixed, re-run as v2. |
+| `s3://...podcast_10m/asr/vibevoice_multilingual_v2_p{N}_16_1.lance` | 16/16 | **221,324,671** | ✅ All complete — 99.77% of source (0.23% gap, ~517K rows). Completed 2026-04-01 — 2026-04-06. Resume jobs for p2/p6/p13 finished 2026-04-06 by 22:47 UTC. |
+| `s3://...podcast_10m/metadata/vibevoice_multilingual_v1_p1.lance` | stray | 0 | ⚠️ Misplaced file (in `/metadata/` instead of `/asr/`, from early exploration) — safe to delete. |
 
 See `audio_asr_vibevoice.md` for per-partition row counts, resume job IDs, and
 analysis dashboards (2026-04-07 podcast comparison / language detection / EN
@@ -327,10 +351,17 @@ A balanced 50M English + ~57M non-English subset of podcast speech. Separate fro
 
 Processed as 8 partitions, then merged.
 
-| Output | S3 URI | Status |
+| Output S3 URI | Rows | Purpose |
 |---|---|---|
-| **Partitions** | `s3://...podcast_10m/metadata/fidelity_en50m_nonen50m_p{0..7}of8.lance` | Done |
-| **Merged** | `s3://...podcast_10m/metadata/fidelity_en50m_nonen50m.lance` | Done |
+| `s3://...podcast_10m/metadata/fidelity_en50m_nonen50m.lance` | ~106M | **Primary output — merge of 8 partition tables below** |
+| `s3://...podcast_10m/metadata/fidelity_en50m_nonen50m_p0of8.lance` | ~13M | Partition 0 |
+| `s3://...podcast_10m/metadata/fidelity_en50m_nonen50m_p1of8.lance` | ~13M | Partition 1 |
+| `s3://...podcast_10m/metadata/fidelity_en50m_nonen50m_p2of8.lance` | ~13M | Partition 2 |
+| `s3://...podcast_10m/metadata/fidelity_en50m_nonen50m_p3of8.lance` | ~13M | Partition 3 |
+| `s3://...podcast_10m/metadata/fidelity_en50m_nonen50m_p4of8.lance` | ~13M | Partition 4 |
+| `s3://...podcast_10m/metadata/fidelity_en50m_nonen50m_p5of8.lance` | ~13M | Partition 5 |
+| `s3://...podcast_10m/metadata/fidelity_en50m_nonen50m_p6of8.lance` | ~13M | Partition 6 |
+| `s3://...podcast_10m/metadata/fidelity_en50m_nonen50m_p7of8.lance` | ~13M | Partition 7 |
 
 ### VibeVoice ASR
 
@@ -393,12 +424,25 @@ Earlier versions (v1, v2) also exist on S3 but are superseded by v3.
 ### Fidelity v1
 
 8 partitions, launched 2026-04-08 on mixed kiwi (Sydney) / omniva (US) clusters.
+Throughput: kiwi ~3.4 frags/min, omniva ~1.1 frags/min (cross-region S3 latency).
 
-| Output Pattern | Status | Notes |
-|---|---|---|
-| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/audio_pipeline/internal_audio_v1_fidelity_p{N}of8.lance` | Running | kiwi ~3.4 frags/min, omniva ~1.1 frags/min (cross-region S3 latency) |
+| Output S3 URI | Purpose |
+|---|---|
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/audio_pipeline/internal_audio_v1_fidelity_p{0..7}of8.lance` (8 tables) | Partition outputs from the 8-way Ray job split |
+| `s3://.../audio_pipeline/internal_audio_v1_fidelity_metadata.lance` | Earlier fidelity run (pre-partition) — may or may not be used downstream |
+| `s3://.../audio_pipeline/internal_audio_v1_acoustic_metadata.lance` | Earlier acoustic-only pipeline run |
+| `s3://.../audio_pipeline/internal_audio_v1_beats_comparison.lance` | BEATs model comparison (early investigation) |
 
-Post-processing plan: merge 8 partitions → `internal_audio_v1_fidelity.lance`, then run fidelity filter.
+Post-processing plan: merge 8 `pNof8` partitions → `internal_audio_v1_fidelity.lance`, then run fidelity filter.
+
+Test / debug tables (not part of production lineage):
+
+| Table | Purpose |
+|---|---|
+| `internal_audio_v1_1_fidelity_test.lance`, `_2_fidelity_test.lance` | Early single-node tests |
+| `internal_audio_v1_fidelity_test.lance`, `_fidelity_metadata_test.lance` | Pipeline validation |
+| `internal_audio_v1_beats_testrun.lance`, `_sequential_testrun.lance` | Sequential + BEATs baselines |
+| `internal_audio_v1_lax_10k_test.lance`, `_lax_pipeline_test.lance` | 10K-row LAX pipeline smoke tests |
 
 ### VibeVoice ASR
 
