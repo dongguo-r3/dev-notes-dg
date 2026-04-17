@@ -255,6 +255,26 @@ repartitioned into 6 fragment partitions. Same resume mechanism as hours_140k ab
 
 ---
 
+### 1.6 podcast_7m (inactive — raw manifest only)
+
+**Status:** Staging placeholder — no downstream processing has been run.
+
+**Source files (manifest only, no audio bytes):**
+
+| Table | S3 URI | Rows | Fragments | Schema |
+|---|---|---|---|---|
+| `raw` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_7m/raw.lance` | 13,315,142 | 134 | `audio_path: string` only |
+| `raw_v2` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_7m/raw_v2.lance` | 13,315,142 | 27 | `audio_path: string` only (recompacted) |
+
+Audio paths point to
+`s3://ai-lumalabs-datasets-ap-se-2/audio_resource/supplier_data/podcast-enclosures-20m-7m-2/...`
+— the second batch of the 20M-podcast-enclosures supplier feed.
+
+No WhisperX ASR, VibeVoice ASR, Fidelity, or Speech Metadata outputs exist for
+this table. It would need segmentation + ASR before it enters the SFT pipeline.
+
+---
+
 ## Family 2: whisperx__multilingual_v1_compacted
 
 The largest audio dataset — 222M podcast speech segments across 36 languages.
