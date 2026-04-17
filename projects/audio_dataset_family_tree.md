@@ -23,7 +23,7 @@
 
 | Family | Fidelity v1 | VibeVoice ASR | Speech Metadata v2 |
 |---|---|---|---|
-| **SFT (5 tables)** | Done (2 need cleanup pass) | Running | 3/5 tables done; 2 big tables (hours_140k, podcast p17-20) in 6-partition processing |
+| **SFT (5 tables)** | Done (2 need cleanup pass) | ✅ Done (9 partitions, 66M rows, finished 2026-04-16) | 3/5 tables done; 2 big tables (hours_140k, podcast p17-20) in 6-partition processing |
 | **multilingual_v1** | Done (221.2M/221.8M, 0.27% gap) | ~81% (13/16 partitions) | ✅ Done — all 12 partitions SUCCEEDED (221.84M rows) |
 | **en50m_nonen50m** | Done (merged from 8 partitions) | Not started | Not started |
 | **internal_audio_v1** | Running (8 partitions) | Not started | Not started |
@@ -96,11 +96,14 @@ schema from the WhisperX ASR pipeline.
 
 #### VibeVoice ASR
 
-| Output | Partitions | Cluster | Status |
-|---|---|---|---|
-| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p1of3.lance` | p1of3 (frags 0-1793) | vibevoice-s0 | TBD |
-| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p2of3.lance` | p2of3 (frags 1793-3586) | vibevoice-s1 | TBD |
-| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p3of3.lance` | p3of3 (frags 3586-5381) | vibevoice-s2 | TBD |
+3 partitions via `partitions_range N,3,1`. Launched 2026-04-16 attempt 3 (00:41 PDT). All complete by 2026-04-16 22:40 UTC.
+
+| Output | Partition | Rows | Job ID | Status |
+|---|---|---|---|---|
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p1of3.lance` | `0,3,1` | 7,275,309 | `raysubmit_gmPJG1hGBJiNfSyi` | ✅ Complete (v26, 2026-04-16 22:40) |
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p2of3.lance` | `1,3,1` | 7,235,639 | `raysubmit_sRfGyqjmqPCxE1x3` | ✅ Complete (v25, 2026-04-16 22:19) |
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p3of3.lance` | `2,3,1` | 7,254,118 | `raysubmit_T9L15MFHmDYa5TsD` | ✅ Complete (v25, 2026-04-16 22:20) |
+| **Total** | | **21,765,066** | | (vs 21,745,714 source, +19K rows from concurrent writes) |
 
 #### Speech Metadata v2
 
@@ -137,9 +140,9 @@ handles the combined writes and prevents duplicate rows via `original_row_id`.
 
 #### VibeVoice ASR
 
-| Output | Cluster | Status |
-|---|---|---|
-| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/convspeech_vibevoice_asr.lance` | vibevoice-s3 | TBD |
+| Output | Rows | Cluster | Job ID | Status |
+|---|---|---|---|---|
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/convspeech_vibevoice_asr.lance` | 6,514,097 | vibevoice-s3 | `raysubmit_1dCMTYz6JywcHE13` | ✅ Complete (v21, 2026-04-16 20:12) |
 
 #### Speech Metadata v2
 
@@ -162,9 +165,9 @@ handles the combined writes and prevents duplicate rows via `original_row_id`.
 
 #### VibeVoice ASR
 
-| Output | Cluster | Status |
-|---|---|---|
-| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p11to14_vibevoice_asr.lance` | vibevoice-s4 | TBD |
+| Output | Rows | Cluster | Job ID | Status |
+|---|---|---|---|---|
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p11to14_vibevoice_asr.lance` | 7,499,644 | vibevoice-s4 | `raysubmit_sFwQKfbEUAtVFxae` | ✅ Complete (v21, 2026-04-16 22:30) |
 
 #### Speech Metadata v2
 
@@ -187,9 +190,9 @@ handles the combined writes and prevents duplicate rows via `original_row_id`.
 
 #### VibeVoice ASR
 
-| Output | Cluster | Status |
-|---|---|---|
-| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p14to17_vibevoice_asr.lance` | vibevoice-s5 | TBD |
+| Output | Rows | Cluster | Job ID | Status |
+|---|---|---|---|---|
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p14to17_vibevoice_asr.lance` | 7,670,431 | vibevoice-s5 | `raysubmit_aDDdJWmhedpKKfHc` | ✅ Complete (v21, 2026-04-16 22:57) |
 
 #### Speech Metadata v2
 
@@ -212,11 +215,14 @@ handles the combined writes and prevents duplicate rows via `original_row_id`.
 
 #### VibeVoice ASR
 
-| Output | Partitions | Cluster | Status |
-|---|---|---|---|
-| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p1of3.lance` | p1of3 (frags 0-1868) | vibevoice-s6 | TBD |
-| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p2of3.lance` | p2of3 (frags 1868-3736) | vibevoice-s7 | TBD |
-| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p3of3.lance` | p3of3 (frags 3736-5606) | vibevoice-s8 | TBD |
+3 partitions via `partitions_range N,3,1`. Launched 2026-04-16 attempt 3 (00:41 PDT). All complete by 2026-04-16 23:36 UTC.
+
+| Output | Partition | Rows | Cluster | Job ID | Status |
+|---|---|---|---|---|---|
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p1of3.lance` | `0,3,1` | 7,533,353 | vibevoice-s6 | `raysubmit_87F1nYJGZsLPDrzA` | ✅ Complete (v27, 2026-04-16 23:13) |
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p2of3.lance` | `1,3,1` | 7,534,293 | vibevoice-s7 | `raysubmit_rVTvJyEutpn8uYR1` | ✅ Complete (v26, 2026-04-16 22:54) |
+| `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p3of3.lance` | `2,3,1` | 7,615,367 | vibevoice-s8 | `raysubmit_r2RXzxTC8tLb3mfS` | ✅ Complete (v26, 2026-04-16 23:36) |
+| **Total** | | **22,683,013** | | | (vs 22,655,625 source, +27K rows from concurrent writes) |
 
 #### Speech Metadata v2
 

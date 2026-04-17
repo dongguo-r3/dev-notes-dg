@@ -869,8 +869,29 @@ For a 3-way split: `0,3,1` / `1,3,1` / `2,3,1` (every 3rd fragment, offset by 0/
 - [x] Create s8 cluster (`dongguo-vibevoice-omniva-s8-23eb17`)
 - [x] Launch all 9 jobs (attempt 3)
 - [x] Verified s3 output: 331K rows, 90.4% non-empty, real transcripts
-- [ ] All jobs complete
-- [ ] Verify final outputs
+- [x] **All 9 jobs complete** (finished 2026-04-16 20:12 – 23:36 UTC)
+- [x] **Verified final output row counts** (see below)
+
+### Final Output Row Counts
+
+Verified 2026-04-17 by querying each output Lance table directly.
+
+| Cluster | Dataset | Rows Written | Last Commit | Version |
+|---------|---------|--------------|-------------|---------|
+| s0 | hours_140k p1of3 | 7,275,309 | 2026-04-16 22:40 UTC | v26 |
+| s1 | hours_140k p2of3 | 7,235,639 | 2026-04-16 22:19 UTC | v25 |
+| s2 | hours_140k p3of3 | 7,254,118 | 2026-04-16 22:20 UTC | v25 |
+| **hours_140k total** | | **21,765,066** (vs 21,745,714 source) | | +0.09% |
+| s3 | convspeech | 6,514,097 | 2026-04-16 20:12 UTC | v21 |
+| s4 | podcast p11-14 | 7,499,644 | 2026-04-16 22:30 UTC | v21 |
+| s5 | podcast p14-17 | 7,670,431 | 2026-04-16 22:57 UTC | v21 |
+| s6 | podcast p17-20 p1of3 | 7,533,353 | 2026-04-16 23:13 UTC | v27 |
+| s7 | podcast p17-20 p2of3 | 7,534,293 | 2026-04-16 22:54 UTC | v26 |
+| s8 | podcast p17-20 p3of3 | 7,615,367 | 2026-04-16 23:36 UTC | v26 |
+| **podcast p17-20 total** | | **22,683,013** (vs 22,655,625 source) | | +0.12% |
+| **Grand total** | | **66,132,251** (vs 66,085,511 source, +0.07%) | | All 5 SFT tables covered |
+
+The small row surplus on the partitioned tables (hours_140k, podcast p17-20) is consistent with Lance's at-least-once write semantics during concurrent writer retries. Downstream consumers should dedupe on `original_row_id` if strict 1:1 matching is required.
 
 ---
 
