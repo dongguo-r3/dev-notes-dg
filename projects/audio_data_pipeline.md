@@ -6,6 +6,7 @@
 > |---|---|---|---|
 > | 2026-03-18 | Fidelity (bandwidth + AES + SED) | `whisperx__eng_v1` (podcast_10m, 10K rows) | ✅ 10K rows in 36 min, 8×H100 kiwi-flyte |
 > | 2026-04-08 | Fidelity | `internal_audio_v1` (~92M rows, 8 partitions) | 🟡 Running — p0 on kiwi (Sydney), p1-p7 on omniva (US, ~30% throughput) |
+> | 2026-04-17 | Speech Metadata v2 (pitch/gender/emotion/age) | 5 SFT tables (~66M rows) + whisperx__multilingual_v1_compacted (221.8M rows, 12-way split) | 🟡 Running — 17 clusters on omniva (5 SFT + 12 multilingual partitions), batch_size=2048, --no-randomized |
 
 ---
 
@@ -870,3 +871,335 @@ For a 3-way split: `0,3,1` / `1,3,1` / `2,3,1` (every 3rd fragment, offset by 0/
 - [x] Verified s3 output: 331K rows, 90.4% non-empty, real transcripts
 - [ ] All jobs complete
 - [ ] Verify final outputs
+
+---
+
+## 2026-04-17: Speech Metadata v2 — SFT Tables (Group 62)
+
+### Goal
+
+Run the new speech metadata v2 pipeline (gender + pitch + volume + speaking rate + emotion + age, commercial-only) on the 5 SFT lance tables (table-2 through table-6 from internal dashboard group 62), same input tables as the 2026-04-16 VibeVoice run. Table-1 (americanrhetoric, 28K rows) is small enough to run locally if needed.
+
+### Source & Destination Tables
+
+| Cluster | Source Table | Source URI | Rows | Dest URI |
+|---------|-------------|------------|------|----------|
+| s0 | hours_140k | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/hours_140k/asr/prefiltered_english__whisperx.lance` | 21,745,714 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/metadata/sft/hours_140k_speech_metadata.lance` |
+| s1 | convspeech | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/convspeech/asr/prefiltered_english__whisperx.lance` | 6,514,097 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/metadata/sft/convspeech_speech_metadata.lance` |
+| s2 | podcast p11-14 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p11to14_whisperx_clean.lance` | 7,499,644 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/metadata/sft/podcast_10m_p11to14_speech_metadata.lance` |
+| s3 | podcast p14-17 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p14to17_whisperx_clean.lance` | 7,670,431 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/metadata/sft/podcast_10m_p14to17_speech_metadata.lance` |
+| s4 | podcast p17-20 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p17to20_whisperx_wild.lance` | 22,655,625 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/metadata/sft/podcast_10m_p17to20_speech_metadata.lance` |
+
+**No partition splits** — pipeline at ~500-700 rows/s per 8-GPU cluster is fast enough to process 22M-row tables in 10-15 hours per cluster.
+
+### Cluster Assignment
+
+Reused the existing omniva-flyte clusters from the 2026-04-16 VibeVoice run (s0-s4). The remaining s5-s8 continue to run VibeVoice on the partitioned tables.
+
+| Cluster | CR Name |
+|---------|---------|
+| s0 | `dongguo-vibevoice-omniva-s0-b76d15` |
+| s1 | `dongguo-vibevoice-omniva-s1-502299` |
+| s2 | `dongguo-vibevoice-omniva-s2-dfb184` |
+| s3 | `dongguo-vibevoice-omniva-s3-9ec3db` |
+| s4 | `dongguo-vibevoice-omniva-s4-eef6d4` |
+
+### Pipeline
+
+- **Pipeline**: `lax.projects.av_data_processing.audio.audio_metadata.speech_metadata_pipeline.run_speech_metadata_pipeline_gpu`
+- **Runtime env**: `lax/projects/av_data_processing/audio/audio_metadata/speech_metadata_runtime_env.json`
+  - `numpy<2.3` (avoids numba conflict pulled in transitively by torchcrepe → resampy)
+  - `torchcrepe>=0.0.22`, `speechbrain>=1.0.0`, `joblib>=1.3.0`
+  - `onnxruntime-gpu>=1.23.0` (critical — prevents CPU-only `onnxruntime` from overriding)
+- **Models loaded per actor (~2.5 GB VRAM)**:
+  - torchcrepe tiny (3M params) for pitch
+  - gender_prithiv.onnx (wav2vec2-base, 95M)
+  - emotion_dpngtm.onnx (wav2vec2-base, 95M) — batch=2 windowing (first 8s + last 8s)
+  - ECAPA-TDNN + SVR for age (15M + SVR)
+- **Output schema** (16 columns): pitch (4), volume (2), speaking_rate (3), gender (2), emotion_dpngtm (3), age_years, age_group
+- **Resource per actor**: `num_cpus=1, num_gpus=0.25, memory=6GB` → 4 actors per GPU × 8 GPUs = 32 actors per cluster
+- **Read batch size**: `read_control_row_based_batch_size=2048` (key tuning lever — tested locally at 24 rows/s per actor, dominant lever on cluster throughput)
+
+### Local Benchmark (before launch)
+
+On 5× H100 GPUs (one per table, single actor each) with 4096 samples:
+
+| Dataset | Throughput (single actor) | Per-row latency |
+|---------|---------------------------|-----------------|
+| americanrhetoric | 24.65 rows/s | 41 ms |
+| hours_140k | 24.62 rows/s | 41 ms |
+| convspeech | 24.24 rows/s | 42 ms |
+| podcast_clean | 25.10 rows/s | 40 ms |
+| podcast_wild | 25.23 rows/s | 40 ms |
+
+Per-model breakdown (ms/row, steady state):
+
+| Step | Latency | % |
+|------|---------|---|
+| gender (ONNX, wav2vec2-base) | 5 | 16% |
+| pitch (optimized torchcrepe + GPU decode) | 6 | 19% |
+| emotion_dpngtm (ONNX, batch=2 windowing) | 6 | 19% |
+| age (ECAPA + SVR) | 13 | 42% |
+| decode + resample + volume + rate | 1 | 4% |
+
+### Key Optimizations Applied
+
+1. **Switched gender model** from alefiury wav2vec2-large (316M) to prithivMLmods wav2vec2-base (95M) — ~5 ms/row savings with 100% agreement on the 5-dataset benchmark.
+2. **Fixed 8s input window** for all ONNX models (tile-repeat for short clips, first 8s for long) — avoids ORT dynamic-shape replanning (~15-20x speedup per ONNX call).
+3. **Batch=2 windowing** for emotion_dpngtm only — captures variation across long clips (first 8s + last 8s, averaged probabilities). Not applied to Audeering (fixed batch=1 ONNX, would require 2x loop).
+4. **Custom GPU decode for torchcrepe** — skip Python postprocess overhead (`torchcrepe.predict` → `torchcrepe.infer` + manual argmax on GPU). 15x speedup vs stock.
+5. **Dropped emotion_superb** — redundant with dpngtm (42% label agreement), no meaningful added signal.
+6. **Dropped Audeering from default pipeline** — non-commercial license (CC-BY-NC-SA). Available as `run_speech_metadata_pipeline_gpu_with_audeering` variant for research comparisons only.
+
+### S3 Checkpoints
+
+```
+s3://ai-lumalabs-checkpoints-ap-se-2/dongguo/speech_metadata/
+  commercial/
+    gender_prithiv.onnx + .onnx.data           (362 MB)
+    emotion_dpngtm.onnx + .onnx.data           (362 MB)
+    age_ecapa/                                  (85 MB)
+    age_svr_model.joblib + age_svr_scaler.joblib
+  non_commercial/
+    audeering_age_gender.onnx                  (1.2 GB)
+    audeering_emotion_dim.onnx                 (630 MB)
+```
+
+### Launch Script
+
+`lax/projects/av_data_processing/audio/audio_metadata/launch_speech_metadata_5jobs.sh`
+
+```bash
+# Verification run on one cluster (8192 rows)
+bash launch_speech_metadata_5jobs.sh --verify 1
+
+# Launch single cluster (full table)
+bash launch_speech_metadata_5jobs.sh 0
+
+# Launch all 5 full jobs
+bash launch_speech_metadata_5jobs.sh
+```
+
+### Job IDs
+
+**Attempt 1** (2026-04-17 07:39 PDT) — verification on s1 with `--limit 8192`. Job ran slowly (limit + randomized sampling forces cross-fragment reads). Stopped manually to avoid wasting cluster time.
+
+- s1 verify: `raysubmit_V59zkuhHFUK6Pdj4` (stopped)
+
+**Attempt 2** (2026-04-17 07:49–07:57 PDT) — full-table runs with `--no-randomized`:
+
+| Cluster | Dataset | Job ID | Notes |
+|---------|---------|--------|-------|
+| s0 | hours_140k | `raysubmit_VWqSuD6Yan3yjs6v` | Launched 07:49, pipeline uploaded with old `batch_size=1024` |
+| s1 | convspeech | `raysubmit_paKM7EAr6EpCdjRZ` | Launched 07:56, `batch_size=2048` |
+| s2 | podcast p11-14 | `raysubmit_Ny9YeHH8mUCL8LPw` | Launched 07:56, `batch_size=2048` |
+| s3 | podcast p14-17 | `raysubmit_6ZjL95CAtdUiQkJb` | Launched 07:57, `batch_size=2048` |
+| s4 | podcast p17-20 | `raysubmit_yeg5RNY6vzCHHchK` | Launched 07:57, `batch_size=2048` |
+
+### Key Lessons
+
+1. **`--limit` with default `--randomized` is slow on large tables** — it forces cross-fragment sampling which reads sparse data from across the lance dataset. Use `--no-randomized` (first N rows, sequential) for verification runs.
+2. **`read_control_row_based_batch_size` is the dominant cluster-throughput lever** (per fidelity pipeline's STATUS.md: 256 → 2048 was ~10x). Always default to 2048 unless the table has very large audio_bytes payloads that risk Arrow 2GB overflow.
+3. **`onnxruntime-gpu` must be explicitly pinned in runtime_env** — otherwise transitive deps (e.g. from `audonnx` or any other package) can install the CPU-only `onnxruntime` and silently fall back to CPU with no visible error (just no `CUDAExecutionProvider` in the provider list).
+4. **Reusing clusters from VibeVoice run** avoided waiting for cluster creation. Useful pattern when doing follow-up metadata extraction on the same tables.
+
+### Status
+
+- [x] Local benchmark on 5 datasets (4096 samples each) — 24 rows/s per actor
+- [x] Upload all checkpoints to S3
+- [x] Launch all 5 jobs (attempt 2)
+- [ ] Verify cluster throughput matches local benchmark × 4 actors × 8 GPUs (~500-700 rows/s per cluster projected)
+- [ ] All jobs complete
+- [ ] Verify final outputs (row counts, schema, sample predictions)
+- [ ] Consider re-launching s0 with `batch_size=2048` if it's noticeably slower than s1-s4
+
+---
+
+## 2026-04-17: Speech Metadata v2 — 17-Job Run Inventory
+
+Unified table of all 17 speech_metadata_v2 jobs running on omniva-flyte as of 2026-04-17 08:26 PDT. Two families:
+
+- **5 SFT jobs** (whole-table): one cluster per table, no partition split.
+- **12 multilingual_v1 jobs**: 12-way fragment split of the 221.8M-row podcast table, one partition per idle cluster.
+
+### Full Run Table
+
+| Cluster (CR name) | Job ID | Source Dataset | Partition | Target Lance Table |
+|-------------------|--------|----------------|-----------|---------------------|
+| `dongguo-vibevoice-omniva-s0-b76d15` | `raysubmit_VWqSuD6Yan3yjs6v` | `audio/sft/hours_140k/asr/prefiltered_english__whisperx.lance` (21.7M rows) | all (whole table) | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/metadata/sft/hours_140k_speech_metadata.lance` |
+| `dongguo-vibevoice-omniva-s1-502299` | `raysubmit_paKM7EAr6EpCdjRZ` | `audio/sft/convspeech/asr/prefiltered_english__whisperx.lance` (6.5M rows) | all (whole table) | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/metadata/sft/convspeech_speech_metadata.lance` |
+| `dongguo-vibevoice-omniva-s2-dfb184` | `raysubmit_Ny9YeHH8mUCL8LPw` | `audio/sft/podcast_10m/asr/podcast_10m_p11to14_whisperx_clean.lance` (7.5M rows) | all (whole table) | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/metadata/sft/podcast_10m_p11to14_speech_metadata.lance` |
+| `dongguo-vibevoice-omniva-s3-9ec3db` | `raysubmit_6ZjL95CAtdUiQkJb` | `audio/sft/podcast_10m/asr/podcast_10m_p14to17_whisperx_clean.lance` (7.7M rows) | all (whole table) | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/metadata/sft/podcast_10m_p14to17_speech_metadata.lance` |
+| `dongguo-vibevoice-omniva-s4-eef6d4` | `raysubmit_yeg5RNY6vzCHHchK` | `audio/sft/podcast_10m/asr/podcast_10m_p17to20_whisperx_wild.lance` (22.7M rows) | all (whole table) | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/metadata/sft/podcast_10m_p17to20_speech_metadata.lance` |
+| `dongguo-metadata-s0-6a0225` | `raysubmit_PNBuTxkxSEwud2cV` | `audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` (221.8M rows) | `--partitions_range 0,12,1` (p0of12, ~18.5M rows) | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/speech_metadata_multilingual_v1_p0of12.lance` |
+| `dongguo-metadata-s1-fed951` | `raysubmit_s82UjvNqwZR2RbEe` | `audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `--partitions_range 1,12,1` (p1of12, ~18.5M rows) | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/speech_metadata_multilingual_v1_p1of12.lance` |
+| `dongguo-metadata-s2-de5369` | `raysubmit_6MvCZWshq2GMBT2s` | `audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `--partitions_range 2,12,1` (p2of12, ~18.5M rows) | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/speech_metadata_multilingual_v1_p2of12.lance` |
+| `dongguo-metadata-s3-c857b1` | `raysubmit_d53KsLTV4Z8rDrpM` | `audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `--partitions_range 3,12,1` (p3of12, ~18.5M rows) | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/speech_metadata_multilingual_v1_p3of12.lance` |
+| `dongguo-metadata-s4-720f5b` | `raysubmit_PHtVFSiJvQ4GjZtT` | `audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `--partitions_range 4,12,1` (p4of12, ~18.5M rows) | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/speech_metadata_multilingual_v1_p4of12.lance` |
+| `dongguo-metadata-s5-d38cd4` | `raysubmit_jXVxu9Sy57wccWne` | `audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `--partitions_range 5,12,1` (p5of12, ~18.5M rows) | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/speech_metadata_multilingual_v1_p5of12.lance` |
+| `dongguo-metadata-s6-30970a` | `raysubmit_mAhxXZV6J8LVa6gV` | `audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `--partitions_range 6,12,1` (p6of12, ~18.5M rows) | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/speech_metadata_multilingual_v1_p6of12.lance` |
+| `dongguo-metadata-s7-ffd6fc` | `raysubmit_gbpXui9gPpwvYcuw` | `audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `--partitions_range 7,12,1` (p7of12, ~18.5M rows) | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/speech_metadata_multilingual_v1_p7of12.lance` |
+| `dongguo-vibevoice-omniva-s5-2e0b2e` | `raysubmit_jt2X3sL6pANRjdGt` | `audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `--partitions_range 8,12,1` (p8of12, ~18.5M rows) | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/speech_metadata_multilingual_v1_p8of12.lance` |
+| `dongguo-vibevoice-omniva-s6-fecd96` | `raysubmit_m5FYHLZDzgii3DAn` | `audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `--partitions_range 9,12,1` (p9of12, ~18.5M rows) | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/speech_metadata_multilingual_v1_p9of12.lance` |
+| `dongguo-vibevoice-omniva-s7-8c00e1` | `raysubmit_vhskJN81bnnfmZSi` | `audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `--partitions_range 10,12,1` (p10of12, ~18.5M rows) | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/speech_metadata_multilingual_v1_p10of12.lance` |
+| `dongguo-vibevoice-omniva-s8-23eb17` | `raysubmit_NQt7whEbEGujyJMB` | `audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `--partitions_range 11,12,1` (p11of12, ~18.5M rows) | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/speech_metadata_multilingual_v1_p11of12.lance` |
+
+### Pipeline & Config (all 17 jobs)
+
+- **Pipeline**: `lax.projects.av_data_processing.audio.audio_metadata.speech_metadata_pipeline.run_speech_metadata_pipeline_gpu`
+- **Runtime env**: `lax/projects/av_data_processing/audio/audio_metadata/speech_metadata_runtime_env.json` (`numpy<2.3`, `torchcrepe`, `speechbrain`, `joblib`, `onnxruntime-gpu`)
+- **Launch scripts**:
+    - 5 SFT: `launch_speech_metadata_5jobs.sh`
+    - 12 multilingual: `launch_speech_metadata_multilingual_12jobs.sh`
+- **Common flags**: `--commit_percentage 0.01 --disable-tracking true --no-randomized`
+- **Reader batch size**: `read_control_row_based_batch_size=2048` (except s0 which was launched with old `batch_size=1024` before the pipeline update at 07:56)
+
+### Cluster Resource Total
+
+All 17 clusters × 8 H100 GPUs = **136 GPUs** fully utilized. At ~500 rows/s per cluster the aggregate throughput is ~8,500 rows/s across all jobs. Expected finish times:
+
+- SFT jobs (~6-23M rows each): 3-13 hours per cluster
+- Multilingual partitions (~18.5M rows each): ~10 hours per partition → all 12 finish within ~10-12h
+
+### Post-processing
+
+After all 12 multilingual partitions finish, merge with:
+
+```bash
+python -m lax.scripts.infra.concat_tables \
+    --src_uris "s3://...speech_metadata_multilingual_v1_p0of12.lance,s3://...p1of12.lance,...,s3://...p11of12.lance" \
+    --dst_uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/speech_metadata_multilingual_v1.lance"
+```
+
+The 5 SFT outputs are standalone and do not need merging.
+
+---
+
+## 2026-04-17 08:47 PDT: Repartition s0 and s4 (6-way split of the 2 biggest SFT tables)
+
+### Rationale
+
+s0 (hours_140k, 21.7M rows) and s4 (podcast p17-20, 22.7M rows) had the longest ETAs (~15-16h each) because they're single-cluster jobs on the two largest tables. Meanwhile s1-s3 (convspeech, podcast p11-14, podcast p14-17) are projected to finish in ~4-5h, after which their 8-GPU clusters become idle.
+
+Strategy: split each of hours_140k and podcast_p17to20 into **6 fragment partitions** so that the work can be spread across multiple clusters when s1-s3 free up. Each partition is ~1/6 of the source = ~3.6M-3.8M rows.
+
+- s0 restarted with `--partitions_range 0,6,2` (partitions 0+1 = 1/3 of hours_140k, ~7.2M rows)
+- s4 restarted with `--partitions_range 0,6,2` (partitions 0+1 = 1/3 of podcast p17-20, ~7.6M rows)
+- Remaining 4+4 = **8 partitions** (partitions 2/3/4/5 of each table) will be distributed to s1, s2, s3 (and any other idle clusters) as those jobs finish.
+
+### Checkpointing / resume
+
+Both jobs keep their original destination URIs (`hours_140k_speech_metadata.lance` and `podcast_10m_p17to20_speech_metadata.lance`). LAX's checkpoint mechanism reads the destination on startup and skips source fragments whose `original_row_id`s have already been committed. Progress from the aborted run (~5% committed for s0, ~4% for s4) is preserved — the relaunched jobs simply skip the done fragments in their new partitions.
+
+### Job Changes
+
+| Cluster | Previous Job (stopped) | New Job | Partition | Rows in partition |
+|---------|-----------------------|---------|-----------|--------------------|
+| s0 | `raysubmit_VWqSuD6Yan3yjs6v` (STOPPED at ~5% done) | `raysubmit_u3cXsqFMgCdtVprE` | `--partitions_range 0,6,2` | ~7.2M (1/3 of hours_140k) |
+| s4 | `raysubmit_yeg5RNY6vzCHHchK` (STOPPED at ~4% done) | `raysubmit_RynKYsTH2fUv1K8W` | `--partitions_range 0,6,2` | ~7.6M (1/3 of podcast p17-20) |
+
+### Remaining partition assignments (pending)
+
+When s1, s2, s3 finish (~4-5h from initial launch), these 8 partitions need to be distributed:
+
+**hours_140k remaining partitions** (4 slots):
+- `--partitions_range 2,6,1` (partition 2, ~3.6M rows)
+- `--partitions_range 3,6,1` (partition 3, ~3.6M rows)
+- `--partitions_range 4,6,1` (partition 4, ~3.6M rows)
+- `--partitions_range 5,6,1` (partition 5, ~3.6M rows)
+
+**podcast p17-20 remaining partitions** (4 slots):
+- `--partitions_range 2,6,1` (partition 2, ~3.8M rows)
+- `--partitions_range 3,6,1` (partition 3, ~3.8M rows)
+- `--partitions_range 4,6,1` (partition 4, ~3.8M rows)
+- `--partitions_range 5,6,1` (partition 5, ~3.8M rows)
+
+Total remaining work across 8 partitions: ~29.6M rows. With 3 helper clusters (s1, s2, s3) running at ~380 rows/s each: 29.6M / (3 × 380) / 3600 = ~7.2h after s1-s3 finish.
+
+### Projected total wall time
+
+- Without repartition: max(s0 ETA, s4 ETA) ≈ ~16h
+- With repartition (if we distribute all 8 remaining partitions across s0, s1, s2, s3, s4 when s1-s3 free up at T+5h):
+  - s0 and s4 handle 1/3 of their own tables each: 7.2M / 380 / 3600 = ~5.3h → finish at T+5.3h
+  - Remaining 4+4 partitions on s1+s2+s3: 29.6M / (3 × 380) / 3600 = 7.2h (distributed) → or split evenly, each handles ~9.9M → ~7.2h on each
+  - Total: max(T+5.3, T+5+7.2) = **T+12.2h** (vs 16h baseline, ~4h savings)
+
+Plan assumes further distribution of partitions 2-5 across s1/s2/s3 once they finish.
+
+---
+
+## 2026-04-17 Afternoon: Multilingual V1 complete, SFT partition dispatch
+
+### Multilingual V1 — all 12 partitions SUCCEEDED
+
+By ~19:42 UTC, all 12 multilingual partition jobs had committed 221.84M rows (100% of the source), with throughput averaging ~420 rows/s per cluster. All Ray jobs transitioned to SUCCEEDED by ~20:00 UTC. The 12 multilingual output tables are at:
+
+```
+s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/metadata/
+    speech_metadata_multilingual_v1_p{0..11}of12.lance
+```
+
+Ready to merge with `lax.scripts.infra.concat_tables` into `speech_metadata_multilingual_v1.lance` when convenient.
+
+### SFT partition re-dispatch (8 partitions on 2 big tables)
+
+After s0 (hours_140k) and s4 (podcast p17-20) were repartitioned at 08:47 with `partitions_range 0,6,2` (1/3 each), the plan was to dispatch the remaining 8 partitions (2, 3, 4, 5 of each table) to clusters as they freed up.
+
+**First dispatch attempt (19:46 UTC, 5 jobs on vibevoice s0-s4)**: 3 of 5 failed with
+`LSUFatalError: ... _rowid_mappings_tmp_.../original_row_id/*.index.json ... 404 NoSuchKey`.
+
+**Root cause**: When multiple jobs share the same destination Lance table and all start within seconds of each other, LAX's resume logic builds `_rowid_mappings_tmp_*` folders in parallel — this causes a race where one job tries to read another job's partially-written manifest files.
+
+**Fix**: serialize subsequent launches to the same dest with ~3 min spacing so each new job's resume phase completes before the next starts.
+
+### Failed & relaunched jobs
+
+| Cluster | Failed Job | Reason | Relaunch Job | Status |
+|---------|-----------|--------|--------------|--------|
+| vibevoice-s0 | `raysubmit_LWZxpUgPKKqnFHGt` | rowid_mappings race | `raysubmit_5hV5PLAEYPPBPS3E` | RUNNING |
+| vibevoice-s2 | `raysubmit_11WRmFeAhcxtfXvG` | rowid_mappings race | `raysubmit_ApraG7urL9zUhm8f` | RUNNING |
+| vibevoice-s3 | `raysubmit_VGyMv5KzpsD2MEHe` | rowid_mappings race | `raysubmit_cQSFxY9E3KUD9zgM` | RUNNING |
+
+### Final 8-partition roster (SFT side)
+
+| Cluster | Job ID | Table | Partition | Status |
+|---------|--------|-------|-----------|--------|
+| vibevoice-s0 | `raysubmit_5hV5PLAEYPPBPS3E` | hours_140k | `2,6,1` | RUNNING |
+| vibevoice-s1 | `raysubmit_X2u43hgz8qSeXhjE` | hours_140k | `3,6,1` | ✅ SUCCEEDED |
+| vibevoice-s2 | `raysubmit_ApraG7urL9zUhm8f` | podcast_p17to20 | `2,6,1` | RUNNING |
+| vibevoice-s3 | `raysubmit_cQSFxY9E3KUD9zgM` | podcast_p17to20 | `3,6,1` | RUNNING |
+| vibevoice-s4 | `raysubmit_PahNjgh64BxDdTXr` | podcast_p17to20 | `4,6,1` | RUNNING |
+| metadata-s0 | `raysubmit_PDH1aB95TZbaPgvx` | hours_140k | `4,6,1` | RUNNING (launched 22:20) |
+| metadata-s1 | `raysubmit_fr2hDgwWuP4zTGXd` | hours_140k | `5,6,1` | RUNNING (launched 22:24) |
+| metadata-s2 | `raysubmit_ADLXTfAuab6thAY9` | podcast_p17to20 | `5,6,1` | RUNNING (launched 22:28) |
+
+With partitions 0+1 from the initial `0,6,2` runs (SUCCEEDED), the 2 destination tables should have complete 6/6 coverage once these 8 jobs finish.
+
+### Lesson learned
+
+When multiple jobs write to the same Lance destination:
+
+1. **Launch them in batches of 1-2 max per destination**, waiting ~3 min between batches.
+2. **LAX's checkpoint/resume preserves prior work** across partition_range changes — no need to use separate destination tables per partition (which would waste already-committed rows).
+3. Once a job is past its initial resume phase (`_rowid_mappings_tmp_*` folders built), concurrent writes from other jobs are fine.
+
+A future improvement: the LAX framework could serialize resume-manifest construction across jobs sharing a destination, or fall back gracefully when a read 404s during the mapping phase (retry with backoff).
+
+### Idle clusters (available for further work)
+
+After the 8 SFT partition jobs are dispatched, the following multilingual clusters are idle and available:
+
+- `dongguo-metadata-s3-c857b1`, `s4-720f5b`, `s5-d38cd4`, `s6-30970a`, `s7-ffd6fc` (5 clusters)
+- `dongguo-vibevoice-omniva-s5-2e0b2e`, `s6-fecd96`, `s7-8c00e1`, `s8-23eb17` (4 clusters)
+
+= **9 idle clusters / 72 H100 GPUs** available for next workload.
+
+### Projected finish
+
+At ~380 rows/s per cluster, each remaining partition is ~3.6M-3.8M rows → ~2.5-2.8h per partition. All 8 SFT partition jobs should finish by **~T+2.5-3h from now** (~01:00 UTC on 2026-04-18).
+
+Total speech_metadata_v2 coverage when all done:
+- **5 SFT tables** (americanrhetoric skipped, ~66M rows): COMPLETE
+- **1 multilingual_v1 table** (221.8M rows): COMPLETE (12 partitions committed)
+
+Grand total: **~288M rows** of audio enriched with gender/pitch/volume/speaking-rate/emotion/age in ~14h of wall time on 17 clusters.
