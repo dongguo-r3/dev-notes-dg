@@ -316,9 +316,9 @@ Two runs: abandoned v1 (empty outputs from `HF_TOKEN` bug), and successful v2.
 
 | Output Pattern | Partitions | Rows | Status |
 |---|---|---|---|
-| `s3://...podcast_10m/asr/vibevoice_multilingual_v1_p{N}_16_1.lance` | p0-p5, p8-p15 (14 tables present) | 0 | ⚠️ Abandoned — `HF_TOKEN` not propagating to `ProcessPoolExecutor` workers; all outputs empty. Bug fixed, re-run as v2. |
 | `s3://...podcast_10m/asr/vibevoice_multilingual_v2_p{N}_16_1.lance` | 16/16 | **221,324,671** | ✅ All complete — 99.77% of source (0.23% gap, ~517K rows). Completed 2026-04-01 — 2026-04-06. Resume jobs for p2/p6/p13 finished 2026-04-06 by 22:47 UTC. |
-| `s3://...podcast_10m/metadata/vibevoice_multilingual_v1_p1.lance` | stray | 0 | ⚠️ Misplaced file (in `/metadata/` instead of `/asr/`, from early exploration) — safe to delete. |
+
+**v1 run (deleted 2026-04-18):** The abandoned v1 tables (14 under `asr/vibevoice_multilingual_v1_p{0,1,2,3,4,5,8,9,10,11,12,13,14,15}_16_1.lance` and 1 stray at `metadata/vibevoice_multilingual_v1_p1.lance`) contained ~207M rows of empty placeholders (`raw_text=""`, `segments="[]"`) from the `HF_TOKEN` not propagating to `ProcessPoolExecutor` spawn workers. Deleted after verifying 0 rows with non-empty transcripts across all 15 tables.
 
 See `audio_asr_vibevoice.md` for per-partition row counts, resume job IDs, and
 analysis dashboards (2026-04-07 podcast comparison / language detection / EN
