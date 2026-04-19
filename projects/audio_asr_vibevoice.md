@@ -313,3 +313,122 @@ Destination prefix: `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podc
 #### 3.8 Handoff to Stage 4
 
 After §3.6, list the ready+idle cluster names + their CR names (the `dongguo-...-xxxxxx` format). Stage 4 will need one cluster per concurrent partition job — the 25 backfill jobs can be sequenced through fewer clusters if parallelism isn't critical (total work is ~860k rows, vs. 287M for the original runs, so each cluster finishes much faster than before).
+
+## 2026-04-19 — Backfill result audit (Stage 5 verification)
+
+Re-ran the delete predicate (`num_tokens = 0 OR segments = '[]' OR truncated = true`)
+as a read-only count across the same 25 tables to measure how much the backfill
+actually reduced invalid rows.
+
+### Headline
+
+**Total invalid rows dropped from 860,206 → 601,894 (−30.0%).**
+Invalid fraction: **0.299% → 0.207%**.
+
+The new hyperparameters (`max_new_tokens 256→512`, vLLM `batch_size 64→16`,
+`read_control_row_based_batch_size 256→128`) recovered most of the
+truncation-driven failures and a good fraction of the vLLM-OOM failures, but
+several tables plateau — the residual looks like a qualitatively different
+failure mode that this hyperparameter round did not address.
+
+### Family-level comparison
+
+| Family | Before: rows | Before: invalid | Before % | After: rows | After: invalid | After % | Δ invalid |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| SFT (9 tables) | 66,132,251 | 541,066 | 0.818% | 68,417,366 | 396,859 | 0.580% | **−144,207 (−26.6%)** |
+| multilingual_v2 (16 tables) | 221,324,671 | 319,140 | 0.144% | 221,838,460 | 205,035 | 0.092% | **−114,105 (−35.8%)** |
+| **TOTAL** | **287,456,922** | **860,206** | **0.299%** | **290,255,826** | **601,894** | **0.207%** | **−258,312 (−30.0%)** |
+
+### Per-table detail (all 25)
+
+Rows and invalid counts as observed at the table's current Lance version; `Δ`
+is `after − before`, so negative = improvement.
+
+| Table | Rows (before) | Rows (after) | Invalid before | Invalid after | Δ invalid | % reduction |
+|---|---:|---:|---:|---:|---:|---:|
+| hours_140k_p1of3 | 7,275,309 | 7,275,295 | 7,494 | 1,835 | −5,659 | −75.5% |
+| hours_140k_p2of3 | 7,235,639 | 7,235,630 | 7,381 | 2,638 | −4,743 | −64.3% |
+| hours_140k_p3of3 | 7,254,118 | 7,251,238 | 72,960 | 1,901 | −71,059 | **−97.4%** |
+| convspeech | 6,514,097 | 6,514,097 | 35,207 | 25,759 | −9,448 | −26.8% |
+| podcast_p11to14 | 7,499,644 | 9,756,046 | 36,155 | 3,838 | −32,317 | **−89.4%** |
+| podcast_p14to17 | 7,670,431 | 7,670,431 | 37,195 | 32,933 | −4,262 | −11.5% |
+| podcast_p17to20_p1of3 | 7,533,353 | 7,546,490 | 123,712 | 114,602 | −9,110 | −7.4% |
+| podcast_p17to20_p2of3 | 7,534,293 | 7,544,848 | 118,807 | 112,253 | −6,554 | −5.5% |
+| podcast_p17to20_p3of3 | 7,615,367 | 7,623,291 | 102,155 | 101,100 | −1,055 | −1.0% |
+| multilingual_v2_p0 | 14,000,000 | 14,016,920 | 16,920 | 17,768 | **+848** | **+5.0%** |
+| multilingual_v2_p1 | 14,000,000 | 14,000,000 | 17,106 | 16,953 | −153 | −0.9% |
+| multilingual_v2_p2 | 13,990,495 | 13,990,495 | 16,407 | 16,081 | −326 | −2.0% |
+| multilingual_v2_p3 | 13,898,108 | 13,898,108 | 15,994 | 8,646 | −7,348 | −45.9% |
+| multilingual_v2_p4 | 13,897,974 | 13,897,974 | 16,193 | 15,055 | −1,138 | −7.0% |
+| multilingual_v2_p5 | 13,337,105 | 13,321,438 | 15,667 | 0 | −15,667 | **−100.0%** |
+| multilingual_v2_p6 | 13,860,492 | 13,860,492 | 16,100 | 8,619 | −7,481 | −46.5% |
+| multilingual_v2_p7 | 13,869,821 | 13,869,821 | 15,782 | 8,513 | −7,269 | −46.1% |
+| multilingual_v2_p8 | 13,863,636 | 13,863,636 | 16,293 | 8,716 | −7,577 | −46.5% |
+| multilingual_v2_p9 | 13,862,549 | 13,862,549 | 17,483 | 15,603 | −1,880 | −10.8% |
+| multilingual_v2_p10 | 13,867,698 | 13,862,580 | 21,282 | 5,970 | −15,312 | −71.9% |
+| multilingual_v2_p11 | 13,897,600 | 13,897,600 | 17,725 | 17,725 | **0** | **0.0%** |
+| multilingual_v2_p12 | 13,897,454 | 13,897,454 | 17,436 | 10,025 | −7,411 | −42.5% |
+| multilingual_v2_p13 | 13,282,309 | 13,799,963 | 35,330 | 16,655 | −18,675 | −52.9% |
+| multilingual_v2_p14 | 13,899,430 | 13,899,430 | 31,288 | 16,891 | −14,397 | −46.0% |
+| multilingual_v2_p15 | 13,900,000 | 13,900,000 | 32,134 | 21,815 | −10,319 | −32.1% |
+
+### What worked (clear wins)
+
+- **hours_140k_p3of3** — 72,960 → 1,901 (−97.4%). The anomalous 10× hot-spot
+  among the three shards is gone; it now matches its siblings' residual rate.
+  The original failure mode was consistent with vLLM OOM (`num_tokens=0`),
+  which the `batch_size 64→16` change addresses directly.
+- **multilingual_v2_p5** — 15,667 → **0** (100% clean).
+- **multilingual_v2_p3 / p6 / p7 / p8** — uniformly ~46% reduction each,
+  consistent with a shared upstream failure mode that the new hyperparameters
+  fully address for the rerun subset but leaves a residual from the original
+  run that didn't get re-processed.
+- **multilingual_v2_p10 / p13 / p14** — 32–72% reduction each on the larger
+  deletable sets.
+- **podcast_p11to14** — 36,155 → 3,838 (−89%). Note row count **grew from 7.50M
+  to 9.76M** (+2.26M); this is out of scope for the backfill, unrelated append
+  — investigate separately (suspicious: only 36,155 were supposed to regenerate).
+
+### What barely moved (stubborn residuals)
+
+- **podcast_p17to20_p{1,2,3}of3** — still 1.3–1.5% invalid (114k / 112k / 101k).
+  Reduction of only ~1–7% per part despite full rerun. The "wild" podcast
+  split's failures are not OOM/truncation — likely malformed audio bytes,
+  extreme durations, or non-speech content that the model genuinely can't
+  transcribe. Needs a different intervention (e.g., pre-filter on audio
+  validity, or lower the `truncated=true` bar).
+- **multilingual_v2_p11** — 17,725 → 17,725 (**exact same count**). Strongly
+  suggests this partition was not part of the rerun, or the rerun reproduced
+  the identical failure set. Worth checking the job history for p11 specifically.
+- **multilingual_v2_p0** — 16,920 → 17,768 (**slightly worse, +848**). The
+  backfill introduced new failures. Row count grew by exactly 16,920 (matching
+  the pre-delete deletable), then +848 of those rerun outputs were themselves
+  invalid — the rerun's new-hyperparameter failure rate on the hardest residual
+  subset is ~5% of that subset.
+- **convspeech**, **podcast_p14to17**, **multilingual_v2_p1 / p2 / p4 / p9** —
+  all < 15% reduction. Low-hanging fruit is exhausted.
+
+### Anomalies to chase later
+
+1. **podcast_p11to14 row-count jump (+2,256,402)**. Only 36,155 rows were
+   flagged for regeneration, yet the table grew by 2.26M. Could indicate a
+   separate append, a rerun that targeted a wider partition range than
+   intended, or a double-write. Low priority (invalid rate dropped 89%), but
+   worth verifying nothing duplicated.
+2. **multilingual_v2_p11 identical counts**. Zero change before/after — check
+   whether the p11 backfill job was actually submitted and succeeded, or
+   whether it was skipped.
+3. **multilingual_v2_p0 regression**. Only table where invalid count went up.
+   Confirms that even with the new hyperparameters, a small fraction of
+   already-flagged rows remain unparseable on rerun.
+
+### Next steps (optional)
+
+- **Targeted third-pass** on the 4 stubborn SFT tables and p11/p15 if downstream
+  consumers need <0.5% invalid everywhere. Needs a different knob than the
+  previous round (pre-filter on audio duration / byte length, parser-tolerant
+  path for JSON failures).
+- **Compaction pass** (`ds.compact_files()`) per table, if read performance is
+  degrading from the mix of soft-deleted rows + sparse backfill fragments.
+- **Escalate to deletion** for the truly unrecoverable ~600k rows — they're a
+  constant 0.2% tax on all downstream consumers otherwise.
