@@ -432,3 +432,646 @@ is `after − before`, so negative = improvement.
   degrading from the mix of soft-deleted rows + sparse backfill fragments.
 - **Escalate to deletion** for the truly unrecoverable ~600k rows — they're a
   constant 0.2% tax on all downstream consumers otherwise.
+
+---
+
+## 4. Transcript Cross-Validation Pipeline (WhisperX vs VibVoice)
+
+Date: 2026-04-17 — 2026-04-19
+
+### 4.1 Motivation
+
+For TTS training, we need transcripts that faithfully represent the spoken content, including filler words. VibVoice is preferred (preserves fillers, matches phonemes), but it's an AR LLM that can hallucinate or produce truncated/repetitive output. WhisperX serves as an independent cross-check for Latin-script languages where it is reliable.
+
+### 4.2 Pipeline Design
+
+The pipeline selects one transcript per audio segment and outputs it in WhisperX format (`[SPEAKER_00]"text"`). Non-speech and low-quality transcripts are rejected with `<no_transcript>`.
+
+**Class-1 gates (all languages):**
+
+| Gate | Condition | Catches |
+|---|---|---|
+| 1 | VV transcript empty | vLLM inference failures (OOM, GPU crash) |
+| 2a | VV truncated (`num_tokens=256`) | Incomplete transcripts from AR token limit |
+| 2b | VV LLM repetition | Pathological AR loops (≥20 consecutive repeats, ≥50% of text, WX cross-check fails) |
+| 2c | VV `[Lyric]`/`[Music]` tag | Non-speech content |
+| 3 | Either version ≥3 speakers | Too complex for TTS |
+
+**Latin language cross-check (Gates 4–6):**
+
+| Gate | Condition | Threshold |
+|---|---|---|
+| 4 | WX transcript empty | Reject |
+| 5 | Length ratio (after dedup + nofiller) | `len_ratio_nf < 0.7` → reject |
+| 6 | WER + char_sim (2 tiers) | Tier a: `wer_nf ≤ 0.20` → accept |
+| | | Tier b: `wer_nf ≤ 0.25` AND `char_sim_nf > 0.90` → accept (phonetic rescue) |
+
+**Non-Latin languages:** Auto-accept VibVoice after class-1 gates (WhisperX unreliable for CJK/Arabic/etc.).
+
+**Version selection (when accepted):**
+- Near-identical (`wer_nf < 0.02`): prefer version with more speakers; default VibVoice
+- Phonetic rescue: VibVoice
+- Speaker count differs: version with more speakers
+- Default: VibVoice (filler preservation)
+
+### 4.3 Threshold Calibration
+
+Manually inspected 50 transcript pairs at each (WER, char_sim) boundary:
+
+| Config | Risk | Problematic % | Key Pattern |
+|---|---|---|---|
+| wer~0.25, cs~0.90 | LOW-MEDIUM | 16% | Mostly fillers/stutters — safest rescue band |
+| wer~0.25, cs~0.85 | MEDIUM | 36% | Numbers dropped by WX; some real word errors |
+| wer~0.30, cs~0.85 | MEDIUM-HIGH | 56% | Wrong words, proper nouns, meaning changes |
+| wer~0.30, cs~0.80 | HIGH | 80% | Nearly all pairs have genuine content errors |
+| wer~0.35, cs~0.85 | HIGH | 60% | Wrong names/phrases, numbers lost |
+
+**Conclusion:** `char_sim` is a stronger safety signal than WER alone. The `wer ≤ 0.25 + char_sim > 0.90` rescue band has only ~16% problematic pairs, while `wer ≤ 0.30 + char_sim > 0.85` jumps to 56%.
+
+### 4.4 Results on Podcast 10M Sample (~500K rows)
+
+Latin acceptance: ~89.7% (86.4% Tier a + 3.3% phonetic rescue). Non-Latin: ~95%+ (class-1 gates only).
+
+### 4.5 Production Deployment — 6 Families, 25 Tables
+
+**Full table manifest with S3 paths:**
+
+| Family | WhisperX Source | VibVoice Table(s) | Output Table |
+|---|---|---|---|
+| **hours_140k** | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/hours_140k/asr/prefiltered_english__whisperx.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p1of3.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_transcript_cv.lance` |
+| | (same) | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p2of3.lance` | (same) |
+| | (same) | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p3of3.lance` | (same) |
+| **convspeech** | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/convspeech/asr/prefiltered_english__whisperx.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/convspeech_vibevoice_asr.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/convspeech_transcript_cv.lance` |
+| **podcast_p11to14** | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p11to14_whisperx_clean.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p11to14_vibevoice_asr.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_p11to14_transcript_cv.lance` |
+| **podcast_p14to17** | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p14to17_whisperx_clean.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p14to17_vibevoice_asr.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_p14to17_transcript_cv.lance` |
+| **podcast_p17to20** | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p17to20_whisperx_wild.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p1of3.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_p17to20_transcript_cv.lance` |
+| | (same) | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p2of3.lance` | (same) |
+| | (same) | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p3of3.lance` | (same) |
+| **multilingual_v2** | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p{0-15}_16_1.lance` (16 partitions) | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cross_validation.lance` |
+
+**Cluster assignment (omniva-flyte):**
+
+| Cluster | Family | Jobs | ~Rows |
+|---|---|---|---|
+| `metadata-s0` | multilingual_v2 (16 partitions) | 16 | 220M |
+| `metadata-s1` | hours_140k (3 partitions) | 3 | 21M |
+| `metadata-s2` | podcast_p17to20 (3 partitions) | 3 | 23M |
+| `metadata-s3` | podcast_p11to14 | 1 | 10M |
+| `metadata-s4` | podcast_p14to17 | 1 | 8M |
+| `metadata-s5` | convspeech | 1 | 7M |
+
+**Execution mode:** Each partition submitted as a Ray job with `--append-to-lance`. Jobs within a family append to the same output Lance table. After all jobs complete, gap-filling adds `<no_transcript>` for WhisperX rows without VibVoice coverage.
+
+**Output schema:** `original_row_id` (uint64), `transcript` (string), `choice` (string), `reason` (string). Joins back to the WhisperX source table via `original_row_id == _rowid`.
+
+### 4.6 Code Locations
+
+| File | Purpose |
+|---|---|
+| `lax/projects/av_data_processing/audio/audio_metadata/demos/transcript_cross_validation.py` | Main script — all logic + batch processing |
+| `lax/projects/av_data_processing/audio/audio_metadata/demos/launch_transcript_cv.sh` | Shell helper to submit Ray jobs per family |
+| `lax/projects/av_data_processing/audio/audio_metadata/demos/runtime_env_transcript_cv.json` | Minimal pip deps |
+| `vibevoice_analysis_v4/compare_sft_asr.ipynb` | Development notebook with analysis and threshold calibration |
+
+### 4.7 Interactive Report
+
+HTML report with audio demos at each filtering stage:
+`s3://ai-lumalabs-dashboard-samples-ap-se-2/dongguo/html-viewer/transcript_selection_whisperx_vibevoice_cross_validation_pipeline.html`
+
+### 4.8 Launch Scripts
+
+**Submit convspeech (metadata-s5):**
+```bash
+cd /Users/dongguo/Projects/lumaverse/projects/lax && source .venv/bin/activate
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s5-d38cd4
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env lax/projects/av_data_processing/audio/audio_metadata/demos/runtime_env_transcript_cv.json \
+    --script lax.projects.av_data_processing.audio.audio_metadata.demos.transcript_cross_validation \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/convspeech/asr/prefiltered_english__whisperx.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/convspeech_vibevoice_asr.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/convspeech_transcript_cv.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Submit podcast_p11to14 (metadata-s3):**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s3-c857b1
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env lax/projects/av_data_processing/audio/audio_metadata/demos/runtime_env_transcript_cv.json \
+    --script lax.projects.av_data_processing.audio.audio_metadata.demos.transcript_cross_validation \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p11to14_whisperx_clean.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p11to14_vibevoice_asr.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_p11to14_transcript_cv.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Submit podcast_p14to17 (metadata-s4):**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s4-720f5b
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env lax/projects/av_data_processing/audio/audio_metadata/demos/runtime_env_transcript_cv.json \
+    --script lax.projects.av_data_processing.audio.audio_metadata.demos.transcript_cross_validation \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p14to17_whisperx_clean.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p14to17_vibevoice_asr.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_p14to17_transcript_cv.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+### 4.9 Job Tracking — Pilot (2026-04-19)
+
+First 3 jobs launched to validate the pipeline:
+
+| Family | Cluster | Job ID | Status |
+|---|---|---|---|
+| convspeech | `metadata-s5` | `raysubmit_RgQVv1pQbSz1HmV3` | Submitted 02:54 UTC |
+| podcast_p11to14 | `metadata-s3` | `raysubmit_SwCfrM3UuPaJwpsx` | Submitted 02:54 UTC |
+| podcast_p14to17 | `metadata-s4` | `raysubmit_ryqGR1ALEdtYS6Uc` | Submitted 02:58 UTC |
+
+Note: first 3 pilot jobs failed due to `lance.write_dataset` not available on the cluster (runtime env installed wrong package). Fixed by using empty pip list (cluster base image already has pylance). Resubmitted:
+
+| Family | Cluster | Job ID | Status |
+|---|---|---|---|
+| convspeech | `metadata-s5` | `raysubmit_vKHAg5matEv2tn3p` | Running (~760 rows/s) |
+| podcast_p11to14 | `metadata-s3` | `raysubmit_7nHFigpHqdpwwqBs` | Running |
+| podcast_p14to17 | `metadata-s4` | `raysubmit_ybWSbnTkBm3fPf2z` | Running |
+
+### 4.10 Per-Partition Output Tables
+
+Each VibVoice partition writes to its own output Lance table to avoid concurrent writer contention. After all jobs complete, merge per-partition outputs into one table per family.
+
+**Complete manifest — 25 VibVoice tables → 25 output tables:**
+
+| # | VibVoice Input Table | WhisperX Source Table | Output Table | Cluster |
+|---|---|---|---|---|
+| 1 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p1of3.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/hours_140k/asr/prefiltered_english__whisperx.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_hours_140k_p1of3.lance` | `metadata-s1` |
+| 2 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p2of3.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/hours_140k/asr/prefiltered_english__whisperx.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_hours_140k_p2of3.lance` | `metadata-s1` |
+| 3 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p3of3.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/hours_140k/asr/prefiltered_english__whisperx.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_hours_140k_p3of3.lance` | `metadata-s1` |
+| 4 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/convspeech_vibevoice_asr.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/convspeech/asr/prefiltered_english__whisperx.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_convspeech.lance` | `metadata-s5` |
+| 5 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p11to14_vibevoice_asr.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p11to14_whisperx_clean.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p11to14.lance` | `metadata-s3` |
+| 6 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p14to17_vibevoice_asr.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p14to17_whisperx_clean.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p14to17.lance` | `metadata-s4` |
+| 7 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p1of3.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p17to20_whisperx_wild.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p17to20_p1of3.lance` | `metadata-s2` |
+| 8 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p2of3.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p17to20_whisperx_wild.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p17to20_p2of3.lance` | `metadata-s2` |
+| 9 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p3of3.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p17to20_whisperx_wild.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p17to20_p3of3.lance` | `metadata-s2` |
+| 10 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p0_16_1.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p0.lance` | `metadata-s0` |
+| 11 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p1_16_1.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p1.lance` | `metadata-s0` |
+| 12 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p2_16_1.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p2.lance` | `metadata-s0` |
+| 13 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p3_16_1.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p3.lance` | `metadata-s0` |
+| 14 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p4_16_1.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p4.lance` | `metadata-s0` |
+| 15 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p5_16_1.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p5.lance` | `metadata-s0` |
+| 16 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p6_16_1.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p6.lance` | `metadata-s0` |
+| 17 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p7_16_1.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p7.lance` | `metadata-s0` |
+| 18 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p8_16_1.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p8.lance` | `metadata-s0` |
+| 19 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p9_16_1.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p9.lance` | `metadata-s0` |
+| 20 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p10_16_1.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p10.lance` | `metadata-s0` |
+| 21 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p11_16_1.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p11.lance` | `metadata-s0` |
+| 22 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p12_16_1.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p12.lance` | `metadata-s0` |
+| 23 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p13_16_1.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p13.lance` | `metadata-s0` |
+| 24 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p14_16_1.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p14.lance` | `metadata-s0` |
+| 25 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p15_16_1.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p15.lance` | `metadata-s0` |
+
+### 4.11 Submit Scripts (22 remaining tables)
+
+Prerequisite: `cd /Users/dongguo/Projects/lumaverse/projects/lax && source .venv/bin/activate && flytecli activate --cluster omniva-flyte`
+
+Common variables:
+```bash
+RUNTIME_ENV="lax/projects/av_data_processing/audio/audio_metadata/demos/runtime_env_transcript_cv.json"
+SCRIPT="lax.projects.av_data_processing.audio.audio_metadata.demos.transcript_cross_validation"
+```
+
+**Table 1: hours_140k_p1of3 (metadata-s1)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s1-fed951
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/hours_140k/asr/prefiltered_english__whisperx.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p1of3.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_hours_140k_p1of3.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 2: hours_140k_p2of3 (metadata-s1)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s1-fed951
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/hours_140k/asr/prefiltered_english__whisperx.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p2of3.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_hours_140k_p2of3.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 3: hours_140k_p3of3 (metadata-s1)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s1-fed951
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/hours_140k/asr/prefiltered_english__whisperx.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p3of3.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_hours_140k_p3of3.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 7: podcast_p17to20_p1of3 (metadata-s2)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s2-de5369
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p17to20_whisperx_wild.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p1of3.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p17to20_p1of3.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 8: podcast_p17to20_p2of3 (metadata-s2)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s2-de5369
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p17to20_whisperx_wild.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p2of3.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p17to20_p2of3.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 9: podcast_p17to20_p3of3 (metadata-s2)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s2-de5369
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p17to20_whisperx_wild.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p3of3.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p17to20_p3of3.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 10: multilingual_v2_p0 (metadata-s0)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s0-6a0225
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p0_16_1.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p0.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 11: multilingual_v2_p1 (metadata-s0)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s0-6a0225
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p1_16_1.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p1.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 12: multilingual_v2_p2 (metadata-s0)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s0-6a0225
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p2_16_1.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p2.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 13: multilingual_v2_p3 (metadata-s0)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s0-6a0225
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p3_16_1.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p3.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 14: multilingual_v2_p4 (metadata-s0)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s0-6a0225
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p4_16_1.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p4.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 15: multilingual_v2_p5 (metadata-s0)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s0-6a0225
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p5_16_1.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p5.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 16: multilingual_v2_p6 (metadata-s0)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s0-6a0225
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p6_16_1.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p6.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 17: multilingual_v2_p7 (metadata-s0)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s0-6a0225
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p7_16_1.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p7.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 18: multilingual_v2_p8 (metadata-s6)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s6-30970a
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p8_16_1.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p8.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 19: multilingual_v2_p9 (metadata-s6)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s6-30970a
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p9_16_1.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p9.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 20: multilingual_v2_p10 (metadata-s6)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s6-30970a
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p10_16_1.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p10.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 21: multilingual_v2_p11 (metadata-s6)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s6-30970a
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p11_16_1.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p11.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 22: multilingual_v2_p12 (metadata-s7)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s7-ffd6fc
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p12_16_1.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p12.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 23: multilingual_v2_p13 (metadata-s7)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s7-ffd6fc
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p13_16_1.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p13.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 24: multilingual_v2_p14 (metadata-s7)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s7-ffd6fc
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p14_16_1.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p14.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Table 25: multilingual_v2_p15 (metadata-s7)**
+```bash
+source scripts/setup-ray-proxy.sh omniva-flyte dongguo-metadata-s7-ffd6fc
+
+python -m lax.scripts.submit_ray_job --no-wait \
+    --runtime-env "${RUNTIME_ENV}" \
+    --script "${SCRIPT}" \
+    -- \
+    --wx-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance" \
+    --vv-uri-template "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/vibevoice_multilingual_v2_p15_16_1.lance" \
+    --vv-partitions 0 \
+    --output-uri "s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p15.lance" \
+    --append-to-lance --batch-size 10000
+```
+
+**Cluster assignment summary (16 multilingual partitions spread across 4 clusters):**
+
+| Cluster | Tables |
+|---|---|
+| `metadata-s0` (`dongguo-metadata-s0-6a0225`) | multilingual_v2_p0 through p7 (8 jobs) |
+| `metadata-s1` (`dongguo-metadata-s1-fed951`) | hours_140k_p1of3, p2of3, p3of3 (3 jobs) |
+| `metadata-s2` (`dongguo-metadata-s2-de5369`) | podcast_p17to20_p1of3, p2of3, p3of3 (3 jobs) |
+| `metadata-s3` (`dongguo-metadata-s3-c857b1`) | podcast_p11to14 (1 job) |
+| `metadata-s4` (`dongguo-metadata-s4-720f5b`) | podcast_p14to17 (1 job) |
+| `metadata-s5` (`dongguo-metadata-s5-d38cd4`) | convspeech (1 job) |
+| `metadata-s6` (`dongguo-metadata-s6-30970a`) | multilingual_v2_p8 through p11 (4 jobs) |
+| `metadata-s7` (`dongguo-metadata-s7-ffd6fc`) | multilingual_v2_p12 through p15 (4 jobs) |
+
+### 4.12 Output Lance Tables — Full Paths
+
+25 output tables containing cross-validated transcripts. Each row has: `original_row_id` (uint64, join key to the WhisperX source table), `transcript` (string, WhisperX format or `<no_transcript>`), `choice` (string), `reason` (string).
+
+**SFT Family — hours_140k** (WhisperX source: `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/hours_140k/asr/prefiltered_english__whisperx.lance`)
+
+| # | Output Table |
+|---|---|
+| 1 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_hours_140k_p1of3.lance` |
+| 2 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_hours_140k_p2of3.lance` |
+| 3 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_hours_140k_p3of3.lance` |
+
+**SFT Family — convspeech** (WhisperX source: `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/convspeech/asr/prefiltered_english__whisperx.lance`)
+
+| # | Output Table |
+|---|---|
+| 4 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_convspeech.lance` |
+
+**SFT Family — podcast_p11to14** (WhisperX source: `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p11to14_whisperx_clean.lance`)
+
+| # | Output Table |
+|---|---|
+| 5 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p11to14.lance` |
+
+**SFT Family — podcast_p14to17** (WhisperX source: `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p14to17_whisperx_clean.lance`)
+
+| # | Output Table |
+|---|---|
+| 6 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p14to17.lance` |
+
+**SFT Family — podcast_p17to20** (WhisperX source: `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p17to20_whisperx_wild.lance`)
+
+| # | Output Table |
+|---|---|
+| 7 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p17to20_p1of3.lance` |
+| 8 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p17to20_p2of3.lance` |
+| 9 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p17to20_p3of3.lance` |
+
+**Pretrain Family — multilingual_v2** (WhisperX source: `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance`)
+
+| # | Output Table |
+|---|---|
+| 10 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p0.lance` |
+| 11 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p1.lance` |
+| 12 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p2.lance` |
+| 13 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p3.lance` |
+| 14 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p4.lance` |
+| 15 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p5.lance` |
+| 16 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p6.lance` |
+| 17 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p7.lance` |
+| 18 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p8.lance` |
+| 19 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p9.lance` |
+| 20 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p10.lance` |
+| 21 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p11.lance` |
+| 22 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p12.lance` |
+| 23 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p13.lance` |
+| 24 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p14.lance` |
+| 25 | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p15.lance` |
+
+**How to use these tables:**
+
+```python
+import lance
+
+# Read an output table
+ds = lance.dataset("s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/transcript_cv_multilingual_v2_p0.lance")
+
+# Get accepted transcripts
+accepted = ds.to_table(filter="choice != 'reject'")
+
+# Join back to WhisperX source table for audio bytes
+wx = lance.dataset("s3://ai-lumalabs-datasets-ap-se-2-lance/audio/pretrain/podcast_10m/asr/whisperx__multilingual_v1_compacted.lance")
+oids = accepted.column("original_row_id").to_pylist()
+audio = wx._take_rows(oids, columns=["audio_bytes", "language", "segment_duration"])
+```
+
+**Output schema:**
+
+| Column | Type | Description |
+|---|---|---|
+| `original_row_id` | uint64 | Join key to the WhisperX source table (`_rowid`) |
+| `transcript` | string | WhisperX format (`[SPEAKER_00]"text"`) or `<no_transcript>` |
+| `choice` | string | `vibevoice`, `whisperx`, `either`, or `reject` |
+| `reason` | string | Human-readable explanation of the decision |
