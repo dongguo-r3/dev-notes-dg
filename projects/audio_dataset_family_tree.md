@@ -255,6 +255,26 @@ repartitioned into 6 fragment partitions. Same resume mechanism as hours_140k ab
 
 ---
 
+### 1.6 podcast_7m (inactive — raw manifest only)
+
+**Status:** Staging placeholder — no downstream processing has been run.
+
+**Source files (manifest only, no audio bytes):**
+
+| Table | S3 URI | Rows | Fragments | Schema |
+|---|---|---|---|---|
+| `raw` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_7m/raw.lance` | 13,315,142 | 134 | `audio_path: string` only |
+| `raw_v2` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_7m/raw_v2.lance` | 13,315,142 | 27 | `audio_path: string` only (recompacted) |
+
+Audio paths point to
+`s3://ai-lumalabs-datasets-ap-se-2/audio_resource/supplier_data/podcast-enclosures-20m-7m-2/...`
+— the second batch of the 20M-podcast-enclosures supplier feed.
+
+No WhisperX ASR, VibeVoice ASR, Fidelity, or Speech Metadata outputs exist for
+this table. It would need segmentation + ASR before it enters the SFT pipeline.
+
+---
+
 ## Family 2: whisperx__multilingual_v1_compacted
 
 The largest audio dataset — 222M podcast speech segments across 36 languages.
@@ -296,9 +316,9 @@ Two runs: abandoned v1 (empty outputs from `HF_TOKEN` bug), and successful v2.
 
 | Output Pattern | Partitions | Rows | Status |
 |---|---|---|---|
-| `s3://...podcast_10m/asr/vibevoice_multilingual_v1_p{N}_16_1.lance` | p0-p5, p8-p15 (14 tables present) | 0 | ⚠️ Abandoned — `HF_TOKEN` not propagating to `ProcessPoolExecutor` workers; all outputs empty. Bug fixed, re-run as v2. |
 | `s3://...podcast_10m/asr/vibevoice_multilingual_v2_p{N}_16_1.lance` | 16/16 | **221,324,671** | ✅ All complete — 99.77% of source (0.23% gap, ~517K rows). Completed 2026-04-01 — 2026-04-06. Resume jobs for p2/p6/p13 finished 2026-04-06 by 22:47 UTC. |
-| `s3://...podcast_10m/metadata/vibevoice_multilingual_v1_p1.lance` | stray | 0 | ⚠️ Misplaced file (in `/metadata/` instead of `/asr/`, from early exploration) — safe to delete. |
+
+**v1 run (deleted 2026-04-18):** The abandoned v1 tables (14 under `asr/vibevoice_multilingual_v1_p{0,1,2,3,4,5,8,9,10,11,12,13,14,15}_16_1.lance` and 1 stray at `metadata/vibevoice_multilingual_v1_p1.lance`) contained ~207M rows of empty placeholders (`raw_text=""`, `segments="[]"`) from the `HF_TOKEN` not propagating to `ProcessPoolExecutor` spawn workers. Deleted after verifying 0 rows with non-empty transcripts across all 15 tables.
 
 See `audio_asr_vibevoice.md` for per-partition row counts, resume job IDs, and
 analysis dashboards (2026-04-07 podcast comparison / language detection / EN
