@@ -1111,4 +1111,9 @@ All 25 jobs completed. Row counts verified against source VibVoice tables:
 
 Note: Tables 4-6 (convspeech, podcast_p11to14, podcast_p14to17) were the pilot jobs and used a slightly different naming convention (`{family}_transcript_cv.lance` instead of `transcript_cv_{family}.lance`). The actual paths are documented in section 4.12 above.
 
-Note: multilingual_p15 has 9,685,845 rows vs expected ~13,900,000. This may indicate the job was still writing when checked, or it terminated early. Needs verification — check Ray job logs for `raysubmit_NTGvs3NNbdDeZUKj` on `vibevoice-omniva-s4`.
+**multilingual_p15 recovery (2026-04-20):**
+
+The original p15 job (`raysubmit_NTGvs3NNbdDeZUKj`) crashed after writing 9,685,845 / 13,900,000 rows (70%). The job was evicted from the cluster (404 on status check). Recovery steps:
+1. Soft-deleted all rows from the incomplete output table (`transcript_cv_multilingual_v2_p15.lance`, v93→v94, 0 rows)
+2. Resubmitted from scratch: `raysubmit_jS8fTtga3t55XqQu` on `vibevoice-omniva-s4` (`dongguo-vibevoice-omniva-s4-eef6d4`)
+3. Expected ~4 hours to complete (~13.9M rows at ~900 rows/s)
