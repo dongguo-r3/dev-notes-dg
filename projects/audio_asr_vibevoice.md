@@ -615,9 +615,9 @@ Each VibVoice partition writes to its own output Lance table to avoid concurrent
 | 1 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p1of3.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/hours_140k/asr/prefiltered_english__whisperx.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_hours_140k_p1of3.lance` | `metadata-s1` |
 | 2 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p2of3.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/hours_140k/asr/prefiltered_english__whisperx.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_hours_140k_p2of3.lance` | `metadata-s1` |
 | 3 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/hours_140k_vibevoice_asr_p3of3.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/hours_140k/asr/prefiltered_english__whisperx.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_hours_140k_p3of3.lance` | `metadata-s1` |
-| 4 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/convspeech_vibevoice_asr.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/convspeech/asr/prefiltered_english__whisperx.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_convspeech.lance` | `metadata-s5` |
-| 5 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p11to14_vibevoice_asr.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p11to14_whisperx_clean.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p11to14.lance` | `metadata-s3` |
-| 6 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p14to17_vibevoice_asr.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p14to17_whisperx_clean.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p14to17.lance` | `metadata-s4` |
+| 4 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/convspeech_vibevoice_asr.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/convspeech/asr/prefiltered_english__whisperx.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/convspeech_transcript_cv.lance` | `metadata-s5` |
+| 5 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p11to14_vibevoice_asr.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p11to14_whisperx_clean.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_p11to14_transcript_cv.lance` | `metadata-s3` |
+| 6 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p14to17_vibevoice_asr.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p14to17_whisperx_clean.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_p14to17_transcript_cv.lance` | `metadata-s4` |
 | 7 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p1of3.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p17to20_whisperx_wild.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p17to20_p1of3.lance` | `metadata-s2` |
 | 8 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p2of3.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p17to20_whisperx_wild.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p17to20_p2of3.lance` | `metadata-s2` |
 | 9 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_10m_p17to20_vibevoice_asr_p3of3.lance` | `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p17to20_whisperx_wild.lance` | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p17to20_p3of3.lance` | `metadata-s2` |
@@ -1007,19 +1007,19 @@ python -m lax.scripts.submit_ray_job --no-wait \
 
 | # | Output Table |
 |---|---|
-| 4 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_convspeech.lance` |
+| 4 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/convspeech_transcript_cv.lance` |
 
 **SFT Family — podcast_p11to14** (WhisperX source: `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p11to14_whisperx_clean.lance`)
 
 | # | Output Table |
 |---|---|
-| 5 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p11to14.lance` |
+| 5 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_p11to14_transcript_cv.lance` |
 
 **SFT Family — podcast_p14to17** (WhisperX source: `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p14to17_whisperx_clean.lance`)
 
 | # | Output Table |
 |---|---|
-| 6 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/transcript_cv_podcast_p14to17.lance` |
+| 6 | `s3://ai-lumalabs-datasets-ap-se-2/dongguo/lax/asr/sft/podcast_p14to17_transcript_cv.lance` |
 
 **SFT Family — podcast_p17to20** (WhisperX source: `s3://ai-lumalabs-datasets-ap-se-2-lance/audio/sft/podcast_10m/asr/podcast_10m_p17to20_whisperx_wild.lance`)
 
@@ -1075,3 +1075,40 @@ audio = wx._take_rows(oids, columns=["audio_bytes", "language", "segment_duratio
 | `transcript` | string | WhisperX format (`[SPEAKER_00]"text"`) or `<no_transcript>` |
 | `choice` | string | `vibevoice`, `whisperx`, `either`, or `reject` |
 | `reason` | string | Human-readable explanation of the decision |
+
+### 4.13 Job Completion Status (2026-04-20)
+
+All 25 jobs completed. Row counts verified against source VibVoice tables:
+
+| # | Table | Output Rows | Versions | Status |
+|---|---|---:|---:|---|
+| 1 | hours_140k_p1of3 | 7,275,295 | 71 | Complete |
+| 2 | hours_140k_p2of3 | 7,235,630 | 70 | Complete |
+| 3 | hours_140k_p3of3 | 7,251,238 | 71 | Complete |
+| 4 | convspeech | 6,514,097 | 64 | Complete |
+| 5 | podcast_p11to14 | 9,756,046 | 94 | Complete |
+| 6 | podcast_p14to17 | 7,670,431 | 74 | Complete |
+| 7 | podcast_p17to20_p1of3 | 7,546,490 | 73 | Complete |
+| 8 | podcast_p17to20_p2of3 | 7,544,848 | 73 | Complete |
+| 9 | podcast_p17to20_p3of3 | 7,623,291 | 74 | Complete |
+| 10 | multilingual_p0 | 14,016,920 | 134 | Complete |
+| 11 | multilingual_p1 | 14,000,000 | 134 | Complete |
+| 12 | multilingual_p2 | 13,990,495 | 134 | Complete |
+| 13 | multilingual_p3 | 13,898,108 | 133 | Complete |
+| 14 | multilingual_p4 | 13,897,974 | 133 | Complete |
+| 15 | multilingual_p5 | 13,321,438 | 128 | Complete |
+| 16 | multilingual_p6 | 13,860,492 | 133 | Complete |
+| 17 | multilingual_p7 | 13,869,821 | 133 | Complete |
+| 18 | multilingual_p8 | 13,863,636 | 133 | Complete |
+| 19 | multilingual_p9 | 13,862,549 | 133 | Complete |
+| 20 | multilingual_p10 | 13,862,580 | 133 | Complete |
+| 21 | multilingual_p11 | 13,897,600 | 133 | Complete |
+| 22 | multilingual_p12 | 13,897,454 | 133 | Complete |
+| 23 | multilingual_p13 | 13,799,963 | 132 | Complete |
+| 24 | multilingual_p14 | 13,899,430 | 133 | Complete |
+| 25 | multilingual_p15 | 9,685,845 | 93 | Check — expected ~13.9M, got 9.7M |
+| | **Total** | **~286M** | | **24 complete, 1 to verify** |
+
+Note: Tables 4-6 (convspeech, podcast_p11to14, podcast_p14to17) were the pilot jobs and used a slightly different naming convention (`{family}_transcript_cv.lance` instead of `transcript_cv_{family}.lance`). The actual paths are documented in section 4.12 above.
+
+Note: multilingual_p15 has 9,685,845 rows vs expected ~13,900,000. This may indicate the job was still writing when checked, or it terminated early. Needs verification — check Ray job logs for `raysubmit_NTGvs3NNbdDeZUKj` on `vibevoice-omniva-s4`.
