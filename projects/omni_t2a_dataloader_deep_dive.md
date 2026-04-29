@@ -1311,29 +1311,169 @@ overlaps §10 by design; both sections will be reviewed together and merged
 later.
 
 Every claim below is grounded in code:
-[`lib/koba_shared/koba_shared/processor/tokenized_types.py`](lib/koba_shared/koba_shared/processor/tokenized_types.py),
-[`omni_vae_ops.py`](lib/koba_shared/koba_shared/processor/omni_vae_ops.py),
-[`omni_audio_ops.py`](lib/koba_shared/koba_shared/processor/omni_audio_ops.py),
-[`omni_vit_ops.py`](lib/koba_shared/koba_shared/processor/omni_vit_ops.py),
-[`omni_text_ops.py`](lib/koba_shared/koba_shared/processor/omni_text_ops.py),
-[`lib/ursa/ursa/models/omni/model/model.py`](lib/ursa/ursa/models/omni/model/model.py),
-[`sequence_packing.py`](lib/ursa/ursa/models/omni/inference/sequence_packing.py).
+[`lib/koba_shared/koba_shared/processor/tokenized_types.py`](../../lumaverse/lib/koba_shared/koba_shared/processor/tokenized_types.py),
+[`omni_vae_ops.py`](../../lumaverse/lib/koba_shared/koba_shared/processor/omni_vae_ops.py),
+[`omni_audio_ops.py`](../../lumaverse/lib/koba_shared/koba_shared/processor/omni_audio_ops.py),
+[`omni_vit_ops.py`](../../lumaverse/lib/koba_shared/koba_shared/processor/omni_vit_ops.py),
+[`omni_text_ops.py`](../../lumaverse/lib/koba_shared/koba_shared/processor/omni_text_ops.py),
+[`lib/ursa/ursa/models/omni/model/model.py`](../../lumaverse/lib/ursa/ursa/models/omni/model/model.py),
+[`sequence_packing.py`](../../lumaverse/lib/ursa/ursa/models/omni/inference/sequence_packing.py).
+
+### 11.0 Reading guide: `SequenceElement` is the anchor
+
+Before diving into the per-token / per-element / per-sample inventory
+tables, it is worth naming the abstraction that makes the rest of this
+section coherent: **`SequenceElement` is the central concept of the data
+representation, and almost every mask, tag, id, or "sub-split" we discuss
+is either a field of a `SequenceElement` or a derivation from one.**
+
+Once you fix on `SequenceElement` as the anchor, every other piece of the
+representation falls out as either an aggregation of elements (samples,
+packs) or a derivation from one element (per-token tensors).
+
+#### Why `SequenceElement` is the right anchor
+
+It is the unique level at which **all of the structural metadata is
+defined**. The 1-to-1 correspondences from the discussion in earlier
+sections all hang off `SequenceElement`:
+
+```
+SequenceElement  ⇔  type           (SequenceType enum)
+                 ⇔  modality       (string)
+                 ⇔  attention_mode (causal / full / noise)
+                 ⇔  num_tokens     ← becomes one entry in split_lens
+                 ⇔  loss flag
+                 ⇔  media (Media wrapper, optional)
+                 ⇔  one entry in attn_modes (after flattening)
+                 ⇔  x_vae          (per VAE element)
+                 ⇔  vae_latent_shapes  (per VAE element)
+                 ⇔  x_vae_by_modality  (per VAE element)
+                 ⇔  clean_vae_img_mask (per VAE element)
+                 ⇔  one TokenizedSequenceElement
+                 ⇔  one set of per-token mask vectors
+                    (text_token_mask[a:b], vae_token_mask[a:b], …)
+```
+
+Every per-element field is either **directly stored on the element**
+(`type`, `modality`, `attention_mode`, …) or **emitted by the
+per-element processor that consumes the element**
+(`text_token_mask[a:b]`, `vae_token_mask[a:b]`, …, where `[a:b]` is the
+element's slice in the packed sequence).
+
+A specific case worth pinning down: **`num_tokens` is *output* by the
+per-element processor, not carried on the input `SequenceElement`.** The
+input element provides the raw media (`media.data`, `media.media_thw`,
+audio waveform, etc.); the processor reads the media and computes
+`num_tokens` from the encoder's compression schedule, then writes both
+`num_tokens` and the per-token tensors onto the corresponding
+`TokenizedSequenceElement`. Concrete formulas:
+
+| Encoder / processor                | Source field on element                  | `num_tokens` formula                                                                       | Code                                                                                                          |
+| ---------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| Image VAE (generation)             | `media.media_thw[1:] = (H, W)`            | `(H // compression_ratio) * (W // compression_ratio) + 2  [+ M registers if noisy]`        | [`omni_vae_ops.py:48-65`](../../lumaverse/lib/koba_shared/koba_shared/processor/omni_vae_ops.py#L48-L65)        |
+| Audio VAE (generation)             | `audio_tensor.shape[-1] = num_frames`     | `ceil(num_frames / compression_factor) + 2  [+ M registers if noisy]`                      | [`omni_audio_ops.py:139-158`](../../lumaverse/lib/koba_shared/koba_shared/processor/omni_audio_ops.py#L139-L158)|
+| Image ViT (understanding, Qwen)    | Qwen processor's `image_grid_thw = (1, ph, pw)` | `ph * pw + 2`                                                                       | [`omni_vit_ops.py:33-49`](../../lumaverse/lib/koba_shared/koba_shared/processor/omni_vit_ops.py#L33-L49) and `:240-242` |
+| Audio AuT (understanding, future)  | (TBD; mirrors ViT, derived from audio encoder's stride) | (TBD; likely `ceil(num_frames / encoder_stride) + 2`)                            | not in current code (see §11.6.1)                                                                              |
+| Video VAE (generation)             | (would extend image VAE with temporal dim)             | (TBD)                                                                              | not in current `lib/koba_shared` (see §11.6.2)                                                                  |
+
+So when the §11.0 list says `SequenceElement ⇔ num_tokens`, the value on
+the right is materialized at processor time, computed from the element's
+media plus the encoder's known stride / compression factor — not a field
+the upstream data builder pre-fills.
+
+#### Hierarchy of abstractions, with `SequenceElement` in the center
+
+```
+       (above the element)              (below the element)
+             |                                  |
+       sample (= list[SequenceElement])    per-token tensors
+       pack   (= list[sample])             (text_token_mask[i],
+       packed-batch tensors                 vae_token_mask[i],
+                                            position_ids[i, :], …)
+
+                 ┌──────────────────────┐
+                 │   SequenceElement    │  ← anchor
+                 │   - type             │
+                 │   - modality         │
+                 │   - attention_mode   │
+                 │   - num_tokens       │
+                 │   - media / x_vae    │
+                 │   - loss             │
+                 └──────────────────────┘
+                            │
+                  per-element processor
+                  (OmniElementText / OmniElementVAEAudio /
+                   OmniElementVAEImage / OmniElementVit)
+                            │
+                            ▼
+              TokenizedSequenceElement
+              (per-token tensors of length num_tokens)
+```
+
+Three observations about this structure:
+
+1. **The data pipeline emits elements; the trainer consumes tokens.**
+   The boundary between the two is the element-list-to-flat-token-tensor
+   transformation done by the per-element processors plus
+   `pack_sequence`. Reading either side in isolation hides the element
+   abstraction; reading them together makes it inevitable.
+
+2. **Element composition encodes task semantics.** A T2A sample is
+   `[TEXT(prompt), NOISY_VAE_AUDIO(audio)]`. A T2I sample is
+   `[TEXT(prompt), NOISY_VAE_IMAGE(image)]`. An A2T sample (when §5.3
+   lands) would be `[NOISY_VAE_AUDIO(audio), TEXT(target)]`. The task is
+   exactly "which sequence of elements does the data builder emit, and
+   what's the loss flag on each." Everything downstream is mechanical.
+
+3. **`SequenceType` is the type system of elements.** When you read
+   `if tok_element.type == NOISY_VAE_AUDIO: …` in a per-element
+   processor, you're not reading a special case — you're reading the
+   dispatch on the element's type tag, which is the *one* free parameter
+   the processor needs to know how to fill in the per-token tensors.
+   This is why the codebase has eight `SequenceType` enum values and one
+   processor per family of types.
+
+#### Practical implication for reading the codebase
+
+When unfamiliar code surfaces, the most productive first question is
+almost always: **"What element is this code operating on, and what's its
+`SequenceType`?"** Answers to that one question short-circuit most of the
+confusion the cross-cutting masks otherwise produce.
+
+| Symptom (confusing on first read)                                              | What to ask                                                                                  |
+| ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| Why does this token go through the LM, not the visual processor?               | What `SequenceType` is its element? Boundary / register tokens of a VAE element answer this. |
+| Why is this token's `attention_mode = noise` but its `text_token_mask = 1`?    | Same question — the orthogonality lives at the element level (§8).                            |
+| Why does this VAE element have `vae_latent_shapes = None`?                     | What's its `modality`? Audio is 1-D, no spatial latent.                                       |
+| Why does the noisy VAE element have `M+N+2` tokens, not 4 separate elements?    | The element is one indivisible unit per `SequenceType`; see §10's discussion in 10.4.         |
+| Why does diffusion loss only fire at certain VAE-token positions?              | `noisy_vae_token_mask` is the noisy-branch leaf within a `NOISY_VAE_*` element.               |
+| Why does the modality dispatch loop iterate `zip(split_lens, attn_modes)`?      | Both lists are 1-to-1 with elements; the loop is "walk the elements left-to-right."           |
+
+In every case the question reduces to "what element are we in, and what's
+its type." The masks, the `attn_mode`, the `position_ids`, the `x_vae`,
+the loss target — all of them are functions of the element. The
+inventory tables in §11.1 onward enumerate the surface of those
+functions, but the function's argument is always a `SequenceElement`.
 
 ### 11.1 Per-token boolean masks (declared on `TokenizedSequenceElement`)
 
 All of these are `torch.Tensor | None` of shape `(seq_len,)`, dtype `bool`,
 declared on
-[`TokenizedSequenceElement`](lib/koba_shared/koba_shared/processor/tokenized_types.py#L10-L67).
+[`TokenizedSequenceElement`](../../lumaverse/lib/koba_shared/koba_shared/processor/tokenized_types.py#L10-L67).
 Granularity is **per token**.
+
+<comment_dg: is it true that if and only if a token satisfies "text_token_mask True or vit_token_mask True", it goes through the understanding stream; seems correct as there is a line "und_mask = torch.logical_or(text_token_mask, vit_token_mask)" in ursa/models/omni/model/mode.py>
+
+<comment_dg: what does set by "`OmniElement{Text,VAEAudio,VAEImage,Vit}`" mean? does it mean that if "Text True & VAEAudio False & VAEImage False & ViT False", then text_token_mask True? A bit counter intuitive, because seems "text_token_mask" could be simply decided by OmniElementText. Or, probably because each of OmniElement{VAEAudio, VAEImage, ViT} have a surrounding wrapping text special token, and optionally text register tokens?>
 
 | Field                    | Comment in `tokenized_types.py`                                          | Set by                                                    |
 | ------------------------ | ------------------------------------------------------------------------ | --------------------------------------------------------- |
 | `text_token_mask`        | "binary mask of which tokens are pure text tokens (not in VAE or ViT)"   | `OmniElement{Text,VAEAudio,VAEImage,Vit}`                  |
+| `txt_loss_mask`          | "binary mask of which tokens receive text supervision"                   | `OmniElementText` (1 on assistant text spans)              |
 | `vae_token_mask`         | "binary mask of which tokens are in the VAE branch"                      | `OmniElementVAE{Audio,Image}`                              |
 | `clean_vae_token_mask`   | "binary mask of which tokens are in clean VAE"                           | `OmniElementVAE{Audio,Image}` on the clean branch          |
 | `noisy_vae_token_mask`   | "binary mask of which tokens are in noisy VAE"                           | `OmniElementVAE{Audio,Image}` on the noisy branch          |
 | `vit_token_mask`         | "binary mask of which tokens are in the ViT branch"                      | `OmniElementVit`                                           |
-| `txt_loss_mask`          | "binary mask of which tokens receive text supervision"                   | `OmniElementText` (1 on assistant text spans)              |
 | `padding_mask`           | "binary mask of which tokens are padding"                                | `OmniQwen3Tokenizer` / `pack_sequence` for the tail block  |
 
 Notes verified against code:
@@ -1342,19 +1482,53 @@ Notes verified against code:
   exclusive at the trainer surface** — the model dispatches each token to
   exactly one of `text_processor`, `visual_processor`, `video_processor`
   by mask boolean. See
-  [`model.py:560–672`](lib/ursa/ursa/models/omni/model/model.py#L560-L672).
+  [`model.py:560–672`](../../lumaverse/lib/ursa/ursa/models/omni/model/model.py#L560-L672).
 - The boundary tokens (`<|vision_start|>` / `<|vision_end|>`) and any
   registers are explicitly carved out of `vae_token_mask` (set to 0) and
   carved into `text_token_mask` (set to 1) inside `OmniElementVAE{Audio,Image}`
-  — see [`omni_vae_ops.py:66-85`](lib/koba_shared/koba_shared/processor/omni_vae_ops.py#L66-L85)
+  — see [`omni_vae_ops.py:66-85`](../../lumaverse/lib/koba_shared/koba_shared/processor/omni_vae_ops.py#L66-L85)
   for the image side and the same pattern on the audio side at
-  [`omni_audio_ops.py:159-178`](lib/koba_shared/koba_shared/processor/omni_audio_ops.py#L159-L178).
+  [`omni_audio_ops.py:159-178`](../../lumaverse/lib/koba_shared/koba_shared/processor/omni_audio_ops.py#L159-L178).
+
+#### Two clarifications worth pinning down
+
+**1. Understanding-stream membership is exactly `text_token_mask | vit_token_mask`.**
+
+A token feeds the understanding stream (LM embedding + ViT-projected latents merged into `und_tokens_embed`) **if and only if** at least one of `text_token_mask` or `vit_token_mask` is True at that position. The trainer materializes the union explicitly at
+[`model.py:600`](../../lumaverse/lib/ursa/ursa/models/omni/model/model.py#L600):
+
+```python
+und_mask = torch.logical_or(text_token_mask, vit_token_mask)
+```
+
+`und_tokens_embed` is then sized to `und_mask.sum()` and filled with the LM embedding lookup at `text_token_mask=1` positions and the projected ViT latents at `vit_token_mask=1` positions. Any token outside the union goes through the VAE or video stream instead.
+
+After §11.6.1 lands the proposed `aut_token_mask` (audio analog of `vit_token_mask`, sourced from a semantic audio encoder), the formula extends to:
+
+```python
+und_mask = text_token_mask | vit_token_mask | aut_token_mask
+```
+
+The if-and-only-if relation remains; the disjunction grows by one term per added understanding-stream encoder.
+
+**2. Why `text_token_mask` is set by all four per-element processors.**
+
+The "Set by" column shows `OmniElement{Text, VAEAudio, VAEImage, Vit}` — *all four* per-element processors write to `text_token_mask`, each for a different subset of positions within their elements. The unifying rule is: **each processor sets `text_token_mask=1` at exactly the positions of its element that feed through the LM embedding lookup**, and `=0` elsewhere.
+
+| Producer                        | Positions where it sets `text_token_mask=1`                                                                         |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `OmniElementText`               | The **whole** element — content text goes through LM weights end-to-end                                              |
+| `OmniElementVAEImage`           | Boundary tokens (`<\|vision_start\|>`, `<\|vision_end\|>`) and registers (noisy branch only) — [`omni_vae_ops.py:74-85`](../../lumaverse/lib/koba_shared/koba_shared/processor/omni_vae_ops.py#L74-L85) |
+| `OmniElementVAEAudio`           | Same pattern with `audio_start` / `audio_end` aliases (today reusing the vision-side strings, per §8.5) — [`omni_audio_ops.py:167-178`](../../lumaverse/lib/koba_shared/koba_shared/processor/omni_audio_ops.py#L167-L178) |
+| `OmniElementVit` (Qwen path)    | Boundary tokens at positions `[0, -1]` — [`omni_vit_ops.py:45-49`](../../lumaverse/lib/koba_shared/koba_shared/processor/omni_vit_ops.py#L45-L49). Non-Qwen ViT path uses no boundaries and is being phased out. |
+
+So a single **noisy VAE element produces tokens of two stream classes simultaneously**: text-stream wrappers (start + M registers + end) with `text_token_mask=1`, and VAE-stream pad slots with `vae_token_mask=1`. The whole block carries one element-level `attn_mode="noise"`. This is the §8 orthogonality of stream and attention mode made concrete — the per-token mask routes which forward-stream weights process the token; the per-element `attention_mode` routes its visibility — and a per-element processor that emits text-stream-bearing positions necessarily writes `text_token_mask`, regardless of the element's overall `type`.
 
 ### 11.2 Per-token mask declared at the trainer surface (not on `TokenizedSequenceElement`)
 
 | Field                      | Where declared                                                                                  | Granularity | Notes                                                                          |
 | -------------------------- | ----------------------------------------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------ |
-| `video_vae_token_mask`     | `Bool[Tensor, " S"] \| None` arg of `model.forward` ([`model.py:496`](lib/ursa/ursa/models/omni/model/model.py#L496), `:1303`) | per token   | Selects video tokens for `video_processor` dispatch. **Not declared on `TokenizedSequenceElement`** — it is constructed by upstream packing code. |
+| `video_vae_token_mask`     | `Bool[Tensor, " S"] \| None` arg of `model.forward` ([`model.py:496`](../../lumaverse/lib/ursa/ursa/models/omni/model/model.py#L496), `:1303`) | per token   | Selects video tokens for `video_processor` dispatch. **Not declared on `TokenizedSequenceElement`** — it is constructed by upstream packing code. |
 
 Verified: zero matches for `video_vae_token_mask` in `lib/koba`,
 `lib/koba_shared`, and `projects/kuma/kuma/projects/omni/audio` (per the
@@ -1370,9 +1544,9 @@ token).
 
 | Field                  | Type                                                                            | Set by / value range                                                                                                         |
 | ---------------------- | ------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `type`                 | `SequenceType` enum                                                              | `TEXT=0`, `NOISY_VAE_IMAGE=1`, `CLEAN_VAE_IMAGE=2`, `VIT_IMAGE=3`, `PACKED=4`, `TEXT_INCOMPLETE=5`, `NOISY_VAE_AUDIO=6`, `CLEAN_VAE_AUDIO=7`, `VIT_AUDIO=8` ([`koba_shared/common/types.py:23-36`](lib/koba_shared/koba_shared/common/types.py#L23-L36)) |
+| `type`                 | `SequenceType` enum                                                              | `TEXT=0`, `NOISY_VAE_IMAGE=1`, `CLEAN_VAE_IMAGE=2`, `VIT_IMAGE=3`, `PACKED=4`, `TEXT_INCOMPLETE=5`, `NOISY_VAE_AUDIO=6`, `CLEAN_VAE_AUDIO=7`, `VIT_AUDIO=8` ([`koba_shared/common/types.py:23-36`](../../lumaverse/lib/koba_shared/koba_shared/common/types.py#L23-L36)) |
 | `modality`             | `str`                                                                            | Task tag, e.g. `"t2a"`, `"t2i"`, `"i2i"`, `"image_edit"`                                                                      |
-| `attention_mode`       | `Literal["causal", "full", "noise"] \| None`                                     | Set by per-element processor ([`tokenized_types.py:64`](lib/koba_shared/koba_shared/processor/tokenized_types.py#L64))         |
+| `attention_mode`       | `Literal["causal", "full", "noise"] \| None`                                     | Set by per-element processor ([`tokenized_types.py:64`](../../lumaverse/lib/koba_shared/koba_shared/processor/tokenized_types.py#L64))         |
 | `num_tokens`           | `int \| None`                                                                    | Element's token count (set in per-element processors)                                                                         |
 | `text_str`             | `str \| list[str] \| None`                                                       | Concatenated string form of the element's tokens                                                                              |
 | `input_ids`            | `Tensor \| None`                                                                 | `[seq_len,]` text-token ids after tokenization                                                                                 |
@@ -1388,15 +1562,15 @@ token).
 
 These appear at packing time (not on `TokenizedSequenceElement` itself),
 produced by `pack_sequence` in
-[`sequence_packing.py`](lib/ursa/ursa/models/omni/inference/sequence_packing.py).
+[`sequence_packing.py`](../../lumaverse/lib/ursa/ursa/models/omni/inference/sequence_packing.py).
 
 | Field                       | Granularity                       | Meaning                                                                                                                  |
 | --------------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | `sample_lens`               | per-sample (one int per sample)   | Token counts per sample inside a packed sequence — FlexAttention block boundaries between samples                        |
-| `split_lens`                | per-element (one int per element) | Token counts per element ([`TokenizedSequencePlan.split_lens`](lib/koba_shared/koba_shared/processor/tokenized_types.py#L78)) |
+| `split_lens`                | per-element (one int per element) | Token counts per element ([`TokenizedSequencePlan.split_lens`](../../lumaverse/lib/koba_shared/koba_shared/processor/tokenized_types.py#L78)) |
 | `attention_modes`           | per-element list (one str per element) | Flattened `attention_mode` strings across one packed sample                                                            |
 | `attn_modes`                | per-token list (one str per token) | Per-token broadcast of `attention_modes`, used inside `prepare_attention_mask_per_sample`                                |
-| `x_vae_by_modality_tensor`  | per-element int tensor             | Int-encoded `x_vae_by_modality` via `MODALITY_TO_INDEX` ([`tensorize.py:119-124`](lib/koba/koba/v2/core/tensorize.py#L119-L124)) |
+| `x_vae_by_modality_tensor`  | per-element int tensor             | Int-encoded `x_vae_by_modality` via `MODALITY_TO_INDEX` ([`tensorize.py:119-124`](../../lumaverse/lib/koba/koba/v2/core/tensorize.py#L119-L124)) |
 | `position_ids`              | `(seq_len, 3)`                     | Concatenated per-token M-RoPE positions across the pack                                                                  |
 | `nested_attention_mask`     | `(seq_len, seq_len)` additive       | Built by `prepare_attention_mask_per_sample` from `(split_lens, attn_modes)`                                              |
 
@@ -1468,9 +1642,9 @@ vit_token_mask  ←→  aut_token_mask
 ```
 
 Producer would be a new `OmniElementAut` (mirroring `OmniElementVit` at
-[`omni_vit_ops.py`](lib/koba_shared/koba_shared/processor/omni_vit_ops.py)).
+[`omni_vit_ops.py`](../../lumaverse/lib/koba_shared/koba_shared/processor/omni_vit_ops.py)).
 Consumer would be a new dispatch path in
-[`model.py:560-672`](lib/ursa/ursa/models/omni/model/model.py#L560-L672)
+[`model.py:560-672`](../../lumaverse/lib/ursa/ursa/models/omni/model/model.py#L560-L672)
 that slices `position_ids[aut_token_mask]` into a hypothetical
 `audio_understanding_processor`. (The model architecture itself is the
 heaviest lift; the mask field is the easy part.)
@@ -1483,9 +1657,9 @@ to avoid the dual-edit hazard later.
 #### 11.6.2 `video_vae_token_mask` — model-internal, not a data-pipeline citizen
 
 **Where it lives.** Top-level `model.forward` arg at
-[`model.py:496`](lib/ursa/ursa/models/omni/model/model.py#L496) and `:1303`.
+[`model.py:496`](../../lumaverse/lib/ursa/ursa/models/omni/model/model.py#L496) and `:1303`.
 **Not declared on `TokenizedSequenceElement`** (verified — absent from
-[`tokenized_types.py`](lib/koba_shared/koba_shared/processor/tokenized_types.py)).
+[`tokenized_types.py`](../../lumaverse/lib/koba_shared/koba_shared/processor/tokenized_types.py)).
 
 **What it does.** Selects video tokens for the separate `video_processor`
 dispatch:
@@ -1529,7 +1703,7 @@ today for audio).
 #### 11.6.3 `clean_vae_img_mask` — misnamed, overlapping with the per-token branch masks
 
 **What the field is.** From
-[`tokenized_types.py:24`](lib/koba_shared/koba_shared/processor/tokenized_types.py#L24):
+[`tokenized_types.py:24`](../../lumaverse/lib/koba_shared/koba_shared/processor/tokenized_types.py#L24):
 
 ```python
 # length N binary mask of which images in the vaes are clean
@@ -1555,7 +1729,7 @@ if not kwargs_cond["clean_vae_img_mask"][index]:    # index is per-element
    `clean_vae_img_mask` is **per-VAE-element**, breaking the convention.
 
 2. **Not image-specific.** The audio-side processor at
-   [`omni_audio_ops.py:181`](lib/koba_shared/koba_shared/processor/omni_audio_ops.py#L181)
+   [`omni_audio_ops.py:181`](../../lumaverse/lib/koba_shared/koba_shared/processor/omni_audio_ops.py#L181)
    sets `clean_vae_img_mask = 1` for `CLEAN_VAE_AUDIO` and `0` for
    `NOISY_VAE_AUDIO`. So the `_img_` infix is wrong — audio sets it too.
    Verified by reading both producers.
@@ -1598,7 +1772,7 @@ have to.
 
 #### 11.6.4 Bonus: `position_ids` shape comment is wrong
 
-In [`tokenized_types.py:62`](lib/koba_shared/koba_shared/processor/tokenized_types.py#L62)
+In [`tokenized_types.py:62`](../../lumaverse/lib/koba_shared/koba_shared/processor/tokenized_types.py#L62)
 the comment says `[3, seq_len]`:
 
 ```python
@@ -1607,7 +1781,7 @@ position_ids: torch.Tensor | None = None
 ```
 
 But the trainer at
-[`model.py:562`](lib/ursa/ursa/models/omni/model/model.py#L562) and
+[`model.py:562`](../../lumaverse/lib/ursa/ursa/models/omni/model/model.py#L562) and
 the docstring at line 334 (`shape (sequence_length, 3) - 3D RoPE
 positions`) treat it as `(S, 3)`. The slicing
 `position_ids[text_token_mask][:, 0]` only makes sense if axis 0 is the
@@ -1668,4 +1842,258 @@ Plus the trivial fix:
 4. **Correct the `position_ids` shape comment** from `[3, seq_len]` to
    `(seq_len, 3)` in `tokenized_types.py`. Trivially small; bundle into
    any of the above PRs.
+
+
+## 12. Alternative design: derive fine-grained masks from `SequenceType`
+
+This section is a counter-proposal to §10's pre-materialization plan.
+**§10 commits to materializing 5 per-token VAE masks** (union + four
+clean/noisy × vision/audio leaves). **§12 argues the leaves are
+redundant**: every leaf is fully derivable from `SequenceType` (the
+per-element enum) plus `split_lens`, and the codebase would be cleaner
+with the leaves *not* materialized. Both designs are kept side-by-side
+for review; one will be picked when §10 and §11 are merged.
+
+### 12.1 Why this discussion exists
+
+Three earlier results in this document set up the question:
+
+1. **§10 chose a 5-mask scheme** — `vae_token_mask` (union) plus four
+   leaves `{clean,noisy}_{vision,audio}_vae_token_mask`. The argument
+   in §10.3.1 was: leaf masks centralize modality classification,
+   eliminate granularity-conversion cost on hot paths, and avoid silent
+   attribution bugs.
+2. **§11.0 named `SequenceElement` as the anchor** — every mask, tag,
+   id, or sub-split is either a field of a `SequenceElement` or
+   derivable from one. Per-element classification (branch + modality)
+   is captured *exactly* by `SequenceType`, an enum on the element.
+3. **The §11.0 1-to-1 correspondence list** showed that the new leaves
+   `{clean,noisy}_{vision,audio}_vae_token_mask` would carry no
+   information beyond what `SequenceType` already encodes per-element.
+
+Putting the three together: **§10's leaves duplicate information already
+on the `SequenceElement`.** The duplication is what §12 questions.
+
+### 12.2 The key factoring: within-element vs element-level signals
+
+The mask family splits cleanly along one axis: does the signal vary
+*within* a single element, or is it constant across the whole element?
+
+| Signal                                                                 | Variation                          | Captured by                                                  |
+| ---------------------------------------------------------------------- | ---------------------------------- | ------------------------------------------------------------ |
+| Which positions are wrappers / registers / pad slots                   | Varies per token within an element | Per-token masks (`text_token_mask`, `vae_token_mask`, `vit_token_mask`, future `aut_token_mask`) |
+| Which branch (clean / noisy)                                            | Constant across the element        | `SequenceType` (one enum value per element)                   |
+| Which modality (image / audio / video)                                  | Constant across the element        | `SequenceType` (same)                                         |
+| Which task (`t2a` / `t2i` / `i2i` / …)                                  | Constant across the element        | `modality` string on the element (or future task-tag field)   |
+
+The first row genuinely needs per-token masks — a single noisy VAE
+element produces tokens of two stream classes (text-stream wrappers and
+VAE-stream pad slots), so stream membership cannot be summarized at the
+element level.
+
+The remaining rows are **uniform across the entire element**. A
+`NOISY_VAE_AUDIO` element's every token belongs to the noisy branch and
+the audio modality; there is no within-element mixing. Materializing
+those signals at per-token granularity (e.g.,
+`noisy_audio_vae_token_mask`) is therefore a redundant projection of
+information that already lives at the element level.
+
+### 12.3 The minimal scheme
+
+If we keep only what is strictly per-token and let the rest live on the
+element:
+
+```
+PER-TOKEN (materialized, ~3-4 fields):
+  text_token_mask         — token feeds LM embedding
+  vae_token_mask          — token feeds the VAE encoder (any branch, any modality)
+  vit_token_mask          — token feeds the ViT projector
+ [aut_token_mask]         — token feeds the audio understanding encoder (future, §11.6.1)
+
+PER-ELEMENT (single source of truth):
+  SequenceType            — already exists; encodes branch + modality exhaustively
+  modality                — already exists; encodes task
+
+PER-TOKEN LEAVES (NOT materialized; computed on demand):
+  noisy_mask              = broadcast(seq_types, split_lens) ∈ {NOISY_VAE_*}
+  clean_mask              = broadcast(seq_types, split_lens) ∈ {CLEAN_VAE_*}
+  audio_vae_mask          = broadcast(seq_types, split_lens) ∈ {NOISY_VAE_AUDIO, CLEAN_VAE_AUDIO}
+  vision_vae_mask         = broadcast(seq_types, split_lens) ∈ {NOISY_VAE_IMAGE, CLEAN_VAE_IMAGE, ...}
+  noisy_audio_vae_mask    = broadcast(seq_types, split_lens) == NOISY_VAE_AUDIO
+  ... (any other slice)
+```
+
+A small helper module owns the `broadcast(seq_types, split_lens)`
+operation and the predicate library:
+
+```python
+# Sketch — ~50 lines total
+def broadcast_seq_types(seq_types: list[SequenceType], split_lens: list[int]) -> Tensor:
+    """Per-element list → per-token tensor of SequenceType ints."""
+    return torch.cat([torch.full((L,), int(t)) for t, L in zip(seq_types, split_lens)])
+
+def vae_mask(per_token_seq_types, *, branch=None, modality=None) -> Tensor:
+    target_types = _types_for(branch, modality)   # exhaustive switch on (branch, modality)
+    return torch.isin(per_token_seq_types, target_types)
+```
+
+Every consumer that wants a leaf calls `vae_mask(...)` with branch /
+modality arguments; the helper handles the broadcast and the predicate
+once.
+
+### 12.4 Comparison table
+
+Honest side-by-side. Both schemes carry identical information; the
+trade-offs are about *where* the information lives and *when* it is
+materialized.
+
+| Aspect                                            | §10 — pre-materialized 5-mask scheme | §12 — derive leaves from `SequenceType`        |
+| ------------------------------------------------- | ------------------------------------ | ----------------------------------------------- |
+| Information content                               | Same                                 | Same                                            |
+| Source of truth                                   | Per-element processor writes the leaf masks | `SequenceType` on the element            |
+| Drift risk (leaf vs union inconsistent)           | Possible — needs phase-0 assertion   | None — derivation has no separate stored copy   |
+| Drift risk (leaves diverge across producer files) | Possible — three processors must stay in sync | None — single helper does the broadcast |
+| Memory cost per packed sample                     | 4 extra bool tensors (~tens of KB)    | One `int` per element (negligible)              |
+| Hot-path cost (leaf query)                        | Free — direct tensor read            | One vectorized broadcast (~free, single-pass)   |
+| Hot-path cost (axis query: "any noisy")           | One OR over two leaves                | One vectorized predicate                        |
+| Call-site readability                             | `noisy_audio_vae_token_mask` (direct) | `vae_mask(branch="noisy", modality="audio")` (one helper call) |
+| Conceptual surface                                | 5 mask names                         | 3 stream masks + 1 enum + N derived predicates  |
+| Maintenance per new modality / SequenceType added | Touch every per-element processor that produces the leaf | Add the new enum value; helpers auto-cover it (typed, exhaustive) |
+| Debug-ability                                     | Direct: print the materialized mask  | Slightly indirect: must run the derivation     |
+| Per-element processor responsibility              | Writes 4 bool masks per element      | Writes 0 leaf masks; sets the `type` field      |
+
+The §12 scheme wins on **drift risk** (both kinds), **memory**,
+**maintenance per new SequenceType**, and **conceptual surface area**.
+The §10 scheme wins narrowly on **call-site readability** (long mask
+name reads as a noun) and **debug-ability** (direct tensor inspection).
+Hot-path costs are effectively tied — both are vectorized, both
+amortized to once per packed sample.
+
+### 12.5 Why §10 originally went the other way
+
+§10.3.1 framed the choice as "coarse + `x_vae_by_modality` (string tag,
+scattered consumer-side classifiers)" vs "leaf masks." Under that
+framing, leaf masks won decisively because the coarse alternative
+required an `is_audio()` table at every consumer site, with the
+attendant silent-attribution-bug failure mode.
+
+That framing **collapsed two coarse alternatives** that have very
+different properties:
+
+| Coarse design                                          | Has the "scattered classifier" problem? |
+| ------------------------------------------------------ | ---------------------------------------- |
+| Coarse + `x_vae_by_modality` (free-form string tag)    | **Yes** — every consumer needs an `is_audio()`-style table over strings, drift-prone as new tags get added |
+| Coarse + `SequenceType` (typed, exhaustive enum)        | **No** — `isin(seq_types, NOISY_AUDIO_TYPES)` is a single typed predicate, exhaustive at compile time |
+
+§10's argument applied to the first row but not the second. With
+`SequenceType` as the source of truth, classification is centralized in
+the enum itself (and the small helper module that wraps it); there is
+no scattering. The §10 verdict therefore does not extend to the
+SequenceType-based design.
+
+This is worth documenting because the natural reading of §10 is "we
+debated coarse-vs-leaf and chose leaf"; the actual conclusion was
+narrower — "we debated string-tag-coarse vs leaf and chose leaf."
+SequenceType-coarse was not in the original comparison.
+
+### 12.6 What §12 requires to land
+
+Three things would have to hold for the §12 scheme to ship cleanly:
+
+1. **Expose `seq_types` at the packed-batch level.** Today every
+   `TokenizedSequenceElement` carries its `type` field (a `SequenceType`
+   enum). After `pack_sequence` flattens elements into a packed dict,
+   the per-element type list needs to be retained as
+   `seq_types: list[SequenceType]` (length = number of elements in the
+   pack). This is mostly a `pack_sequence` plumbing addition — the
+   information is already on each element; it just needs to survive the
+   flatten.
+2. **A small helper module** (~50 lines) that owns
+   `broadcast_seq_types(seq_types, split_lens)` and a predicate library
+   covering the canonical slices: `mask_for_branch("noisy")`,
+   `mask_for_modality("audio")`, `mask_for_branch_and_modality("noisy", "audio")`,
+   etc. The predicates iterate over `SequenceType`'s enum values
+   exhaustively, so adding a new `SequenceType` value (e.g.,
+   `NOISY_VAE_VIDEO` if we ever split video out) only requires updating
+   the enum-to-category mapping in the helper.
+3. **Generalize §10's lazy-OR principle.** §10 already chose to compute
+   axis rollups (e.g., "any noisy slot") on the fly via OR rather than
+   materializing them. §12 extends this to *all* leaf-level classifications:
+   nothing per-token is materialized beyond the strictly necessary
+   stream-membership masks; everything else is derived.
+
+Migration is similar in scope to §10's phase 1 — the bulk is updating
+consumers — but the per-element-processor side is *simpler* (those
+processors no longer need to write any leaf masks; only the union
+`vae_token_mask` plus the existing per-token stream masks).
+
+### 12.7 What `x_vae_by_modality` becomes under §12
+
+`x_vae_by_modality` (the per-element string tag, today storing values
+like `"t2a"` / `"t2i"`) overlaps with `SequenceType` for the
+modality-classification job, and §10 already noted (in 10.6 phase 3)
+that it is a candidate for collapse.
+
+Under §12 the redundancy is sharper. `SequenceType` covers the (branch,
+modality) classification exhaustively and with type-safety;
+`x_vae_by_modality` only adds the *task* dimension (e.g., distinguishing
+`"t2a"` from `"a2a"` for sampler-time decisions and timestep shift
+mappings). After §12 lands:
+
+- **For stream routing and loss attribution** — use `SequenceType`
+  derivation; drop `x_vae_by_modality`.
+- **For sampler-time per-task decisions** (timestep shift schedule,
+  per-task branching in `tdm_sampler.py`) — keep a per-element `task`
+  string, possibly renaming `x_vae_by_modality` → `task` to reflect its
+  remaining purpose. This is its own small cleanup.
+
+### 12.8 Recommendation
+
+§12 is a more principled design than §10. The leaf masks in §10 are a
+cache for information already exhaustively encoded by `SequenceType`,
+and the cache adds drift risk, memory, and per-processor write
+duplication without a meaningful hot-path benefit.
+
+However, **§12 commits us to a stronger architectural reliance on
+`SequenceType` being the canonical classification** — adding new modality
+families requires updating the enum and the helper's predicate library,
+and any code that wants to act on a slice has to go through the helper
+rather than reading a tensor directly. That coupling is fine in
+principle but worth being explicit about.
+
+When merging §10 and §11 (and now §12) into a single plan, my
+recommendation is:
+
+- **Adopt the §12 minimal scheme** as the target end-state for the mask
+  rename.
+- **Keep §10's phase-0 / phase-1 migration framing** for compatibility
+  during the transition — the data pipeline can still write the legacy
+  `clean_vae_token_mask` / `noisy_vae_token_mask` plus the new
+  `seq_types` / helper-derived leaves in parallel, until consumers move
+  over.
+- **Drop §10's four pre-materialized leaf masks** before phase 2 lands.
+  The four-leaf scheme was a step we'd have to walk back to reach §12;
+  going straight to §12 saves the round-trip.
+
+§10's phase 3 (`x_vae_by_modality` cleanup) folds naturally into §12.7
+above.
+
+### 12.9 Open questions for review
+
+- Is there a consumer pattern we haven't surfaced where direct tensor
+  inspection (debug or otherwise) of `noisy_audio_vae_token_mask` would
+  be materially harder than running the helper? The current §11
+  inventory doesn't reveal one, but the inference paths
+  (`tdm_sampler.py`, `generate_modality_disaggregated.py`) deserve a
+  closer audit before committing.
+- Does the helper's predicate library need to be extensible at runtime
+  (callers register new `(branch, modality) → SequenceType` mappings),
+  or is the compile-time enumeration sufficient? Probably the latter
+  for the foreseeable future, but worth confirming.
+- Should `SequenceType` itself be refactored into two orthogonal axes
+  (`branch ∈ {clean, noisy}` × `modality ∈ {image, audio, video}`) so
+  the helper's predicate library doesn't have to enumerate the
+  cross-product manually? Tempting but a bigger change — would touch
+  the dataclass definition in `koba_shared/common/types.py` and every
+  per-element processor that switches on `type`.
 
