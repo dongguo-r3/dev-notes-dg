@@ -29,33 +29,46 @@ sample = {
     "audio_bytes": <raw bytes>,
     "raw_transcript": "Once upon a time in a quiet village by the sea...",
     "duration": 5.0,
-    "conversation_modality": "t2a",
 }
 ```
-
-<comment_dg: is the `"conversation_modality": "t2a"` read from table, or defined (and probably "t2a" hard coded) in some dataset classes in some python code>
 
 No `SequenceElement`s yet. The pipeline is a chain of processors that
 each mutate `sample` in place.
 
-## Stage 1: audio decode and normalize
+> *Side note:* you might expect a `conversation_modality` field on the
+> raw row. It is **not** in the Lance source — it is *injected* by an
+> early-pipeline processor (next stage). Discussion entry
+> [§1: `conversation_modality` provenance](#1-conversation_modality-provenance)
+> covers where the value comes from and why.
+
+## Stage 1: audio decode, normalize, and metadata injection
 
 Producers: [audio_ops.py](../../lumaverse/lib/koba/koba/processor/audio_ops.py),
-[audio_batching_ops.py](../../lumaverse/lib/koba/koba/processor/audio_batching_ops.py).
+[audio_batching_ops.py](../../lumaverse/lib/koba/koba/processor/audio_batching_ops.py),
+[omni_interleaved_packed_ops_refactor.py — `AddDummyConversationModality`](../../lumaverse/lib/koba/koba/processor/omni_interleaved_packed_ops_refactor.py#L57-L66).
 
-`AudioDecoder.forward(sample)` decodes `audio_bytes` → `audio_tensor` of
-shape `(80000,)` (5 s × 16 kHz).
+Three small per-sample mutations happen here, all before any
+`SequenceElement` exists:
 
-`AudioToX.forward(sample)` normalizes (peak / RMS) and writes back to
-`sample["audio_tensor"]`. Shape unchanged.
-
-Optional bucketed-loader step: `_PadAudioToCeiling.forward(sample)` pads
-`audio_tensor` up to a bucket-uniform length (per
-[omni_t2a_packing_koba_v2.py:51-99](../../lumaverse/projects/kuma/kuma/projects/omni/audio/data/omni_t2a_packing_koba_v2.py#L51-L99)).
-Skipped here since we're using the non-bucketed path.
+- `AudioDecoder.forward(sample)` decodes `audio_bytes` → `audio_tensor`
+  of shape `(80000,)` (5 s × 16 kHz).
+- `AudioToX.forward(sample)` normalizes (peak / RMS) and writes back to
+  `sample["audio_tensor"]`. Shape unchanged.
+- Optional bucketed-loader step: `_PadAudioToCeiling.forward(sample)`
+  pads `audio_tensor` up to a bucket-uniform length (per
+  [omni_t2a_packing_koba_v2.py:51-99](../../lumaverse/projects/kuma/kuma/projects/omni/audio/data/omni_t2a_packing_koba_v2.py#L51-L99)).
+  Skipped here since we're using the non-bucketed path.
+- `AddDummyConversationModality.forward(sample)` injects
+  `sample["conversation_modality"] = "t2a"` (the value comes from the
+  pipeline config, not the row). This is the field `OmniAudioSeqBuilder`
+  reads next stage to dispatch to its T2A handler.
+- Optional: `AppendDurationToTranscript.forward(sample)` may append
+  `". 5.0 seconds long."` to the transcript when
+  `audio_length_probability > 0`.
 
 Still no `SequenceElement`s. Audio data lives at `sample["audio_tensor"]`;
-transcript at `sample["raw_transcript"]`.
+transcript at `sample["raw_transcript"]`; the injected modality tag at
+`sample["conversation_modality"]`.
 
 ## Stage 2: build the initial `sequence_plan`
 
@@ -63,8 +76,6 @@ Producer: [omni_audio_packed_ops.py:78-103](../../lumaverse/lib/koba/koba/proces
 
 `OmniAudioSeqBuilder.handle_t2a(sample)` produces the first
 `SequenceElement` list:
-
-<comment_dg: need to explain the design of "type' and "modality" field of sequence element, what are they used for, and what are the difference of them?>
 
 ```python
 sample["sequence_plan"] = [
@@ -90,19 +101,20 @@ either `text_str` (for TEXT) or `media` (for NOISY_VAE_AUDIO). **No
 `num_tokens` yet** — that is a `TokenizedSequenceElement` field,
 materialized later.
 
+> *Side note:* `type` and `modality` look similar but answer different
+> questions. `type` (a `SequenceType` enum) drives processor dispatch
+> and attention-mode selection; `modality` (a string) drives task-level
+> behavior at sampling and loss attribution. See discussion entry
+> [§2: `type` vs `modality` field design](#2-type-vs-modality-field-design)
+> for the breakdown.
+
 ## Stage 3: pair each `SequenceElement` with a `TokenizedSequenceElement`
 
-Producer: [omni_interleaved_packed_ops_refactor.py:984](../../lumaverse/lib/koba/koba/processor/omni_interleaved_packed_ops_refactor.py#L984).
-
-<comment_dg: could I understand this step as "creating a data class / place holder (TokenizedSequenceElement) to store the processed (e.g. tokenized and encoded) raw data elements"? Meanwhile, could I understand the last step as "creating a data class / placeholder (SequenceElement) for the input data element and type & modality info"? That's, storing different stage of the data element?>
-
-<comment_dg: By the end of this class, the list of SequenceElement and list of TokenizedSequenceElement, are all stored as fields of sample: dict. So, so far, sample contains everything of a data sample, right?>
-
-<comment_dg: and there is a critical >
+Producer: [omni_interleaved_packed_ops_refactor.py:511-528](../../lumaverse/lib/koba/koba/processor/omni_interleaved_packed_ops_refactor.py#L511-L528).
 
 `OmniAddTokenizedSequenceElement.forward(sample)` creates an empty
-`TokenizedSequenceElement` for each `SequenceElement`, copying `type`
-and `modality`:
+`TokenizedSequenceElement` for each `SequenceElement`, copying *only*
+`type` and `modality`:
 
 ```python
 sample["tokenized_sequence_plan"] = [
@@ -112,7 +124,20 @@ sample["tokenized_sequence_plan"] = [
 ```
 
 The pairing is positional: `tokenized_sequence_plan[i]` corresponds to
-`sequence_plan[i]`. Subsequent processors mutate the tokenized side.
+`sequence_plan[i]`. Subsequent processors (Stages 5–8) mutate the
+tokenized side, leaving the `SequenceElement` side mostly untouched.
+
+> *Side note:* this stage introduces a structural asymmetry — the SE
+> list now carries the *content* (raw text strings, source media tensors)
+> while the TSE list carries only *structural identity* (`type`,
+> `modality`); every other TSE field is `None` until later stages fill
+> it in. The SE / TSE separation is deliberate and is the basis for the
+> "data builder vocabulary vs trainer vocabulary" mental model.
+> Discussion entry
+> [§3: `SequenceElement` vs `TokenizedSequenceElement`](#3-sequenceelement-vs-tokenizedsequenceelement)
+> walks through three related questions: the SE-as-input / TSE-as-output
+> framing, `sample` as universal accumulator, and the per-field
+> asymmetry at end of this stage.
 
 ## Stage 4: optional CFG dropout
 
@@ -372,3 +397,234 @@ Three things worth noting:
    and §11.0 emphasized: per-element processors emit one indivisible
    block per `SequenceType`, even though the per-token masks within it
    differ.
+
+## Design notes & clarifications
+
+This section pairs questions that arose while reviewing the walkthrough
+with code-grounded answers. The 11 stages above stay lean; technical
+details and design rationale that would otherwise weigh down the linear
+flow live here. Each entry is self-contained and answers a specific
+question; cross-references in the main stages point here by section
+number. Read top-to-bottom for the full design context, or jump
+directly to the entry referenced from the stage you're looking at.
+
+### 1. `conversation_modality` provenance
+
+**Question.** Is `sample["conversation_modality"] = "t2a"` read from the
+Lance source row, or is it hardcoded somewhere?
+
+**Answer: hardcoded in the pipeline config, not read from the table.**
+
+The flow:
+
+1. **Pipeline-level constant.** `default_t2a_pipeline_params()` at
+   [default_t2a.py:148-149](../../lumaverse/lib/koba/koba/pipelines/default_t2a.py#L148-L149)
+   defines:
+
+   ```python
+   conversation_modality_key="conversation_modality",
+   conversation_modality_value="t2a",
+   ```
+
+2. **Processor injection.** `AddDummyConversationModality.forward(sample)`
+   at [omni_interleaved_packed_ops_refactor.py:57-66](../../lumaverse/lib/koba/koba/processor/omni_interleaved_packed_ops_refactor.py#L57-L66)
+   writes the value into the sample dict:
+
+   ```python
+   sample[self.config.conversation_modality_key] = self.config.conversation_modality_value
+   #     ↑ "conversation_modality"                  ↑ "t2a"
+   ```
+
+The `Dummy` in the class name is the giveaway — the field is *injected*
+into the sample, not read from it. Every T2A pipeline run tags every
+sample with `"t2a"`; T2I runs use `"t2i"` (default in the same Config
+class); T2V uses `"t2v"`; etc.
+
+This design has two implications:
+
+- The Lance schema doesn't need a `conversation_modality` column. The
+  same Lance table can be read by different pipelines, each tagging with
+  its own task identifier.
+- `OmniAudioSeqBuilder` (Stage 2) reads `conversation_modality` to
+  dispatch to the right `handle_<task>` method
+  ([omni_audio_packed_ops.py:108-128](../../lumaverse/lib/koba/koba/processor/omni_audio_packed_ops.py#L108-L128)).
+  So the value injected here is the input that selects which sequence
+  plan gets built.
+
+### 2. `type` vs `modality` field design
+
+**Question.** Both fields appear on every `SequenceElement` and look
+similar — what's the difference, and why are they both needed?
+
+**Answer: they answer different questions and drive different downstream
+decisions.**
+
+| Field      | Type             | What it answers                                                                                                | Drives                                                                                                                                                                              |
+| ---------- | ---------------- | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `type`     | `SequenceType` enum | **What is the structural role of this element?** TEXT / NOISY_VAE_IMAGE / CLEAN_VAE_IMAGE / NOISY_VAE_AUDIO / VIT_IMAGE / etc. — encodes (data-modality + branch) jointly. | Which per-element processor handles it (TEXT → `OmniElementText`; NOISY_VAE_AUDIO → `OmniElementVAEAudio` noisy branch / "noise" attention mode), per-token mask layout, attention mode |
+| `modality` | `str`            | **What task does this element belong to?** `"t2a"`, `"t2i"`, `"i2i"`, `"image_edit"`, `"a2a"` (future), etc.    | Sampler-time per-task branching, timestep shift schedule (per the omni-data docs), encoder-internal dispatch via `x_vae_by_modality`                                               |
+
+Concrete example showing they're orthogonal — same `type` can appear
+under different `modality`'s, and same `modality` can have multiple
+`type`'s in one sample:
+
+| `type`              | `modality` | Meaning                                                                  |
+| ------------------- | ---------- | ------------------------------------------------------------------------ |
+| `NOISY_VAE_AUDIO`   | `"t2a"`    | Audio output of a text→audio task (current omni-t2a)                      |
+| `NOISY_VAE_AUDIO`   | `"a2a"`    | Audio output of an audio→audio task (future, after deep-dive §5.3 lands)  |
+| `NOISY_VAE_IMAGE`   | `"t2i"`    | Image output of a text→image task                                         |
+| `NOISY_VAE_IMAGE`   | `"i2i"`    | Image output of an image-edit task                                        |
+| `TEXT`              | `"t2a"`    | The text prompt of a text→audio sample                                    |
+| `TEXT`              | `"t2i"`    | The text prompt of a text→image sample (same `type`, different task)      |
+
+In the T2A walkthrough's Stage 2, both elements (TEXT and
+NOISY_VAE_AUDIO) share `modality="t2a"` — they belong to the same
+task. Their `type` differs because they play different structural roles
+within that task.
+
+`type` is consumed by per-element processors and by the structural
+triplet `(sample_lens, split_lens, attn_modes)`; `modality` is consumed
+by sampler / loss code that needs task-level branching. Same element
+can appear in multiple tasks with the same `type` but different
+`modality`.
+
+### 3. `SequenceElement` vs `TokenizedSequenceElement`
+
+Three closely related questions about the SE / TSE pair, answered
+together because they share the same underlying design.
+
+#### Q3a. Is SE the input-side placeholder and TSE the processed-side placeholder?
+
+**Yes, mostly correct — with one wrinkle.** The split is the "two-stage"
+interpretation:
+
+- **`SequenceElement` (SE)** — the *semantic plan* abstraction. The
+  data builder (`OmniAudioSeqBuilder.handle_t2a`) emits a list of these.
+  Each carries `type`, `modality`, `loss`, plus a *source* (`text_str`
+  for TEXT elements, `media` for VAE/ViT elements). It is the data
+  builder's vocabulary.
+- **`TokenizedSequenceElement` (TSE)** — the *processed-tensor*
+  abstraction. The per-element processors (`OmniElementVAEAudio`,
+  `OmniElementText`, ...) populate these with `num_tokens`, `input_ids`,
+  all the per-token masks, `attention_mode`, etc. It is the trainer's
+  vocabulary.
+
+**The wrinkle:** per-element processors *also* mutate the SE side for
+some derived fields. Specifically, `OmniElementVAEImage.forward` at
+[omni_vae_ops.py:60](../../lumaverse/lib/koba_shared/koba_shared/processor/omni_vae_ops.py#L60)
+and the `OmniElementVAEAudio` analog
+([omni_audio_ops.py:150](../../lumaverse/lib/koba_shared/koba_shared/processor/omni_audio_ops.py#L150))
+write back to `og_element.text_str` after building the wrapper string:
+
+```python
+og_element.text_str = "".join(tokens)         # SE side gets the wrapper text
+tok_element.text_str = "".join(tokens)        # TSE side gets the same
+```
+
+So strictly, SE isn't *immutable* / *input-only* after Stage 2 — its
+`text_str` field gets written by the per-element processor. But for
+*information flow*, the SE → TSE distinction is exactly the right mental
+model.
+
+A cleaner restatement of the rule: **SE carries data needed to *build*
+the per-token tensors; TSE carries the per-token tensors themselves.**
+Some fields (like `text_str` for VAE elements) appear on both sides
+because they're constructed by the per-element processor in Stage 5
+and then needed downstream by the tokenizer step in Stage 7.
+
+#### Q3b. Is `sample` (the dict) the universal accumulator carrying both lists?
+
+**Yes, exactly right.** Every processor in the chain mutates a single
+`sample: dict` in place. By Stage 9 the dict has accumulated:
+
+```python
+sample = {
+    # Stage 0 — original Lance row fields:
+    "audio_bytes":     <bytes>,                  # may be popped after decode
+    "raw_transcript":  "Once upon a time...",
+    "duration":        5.0,
+    # Stage 1 — injected by AddDummyConversationModality:
+    "conversation_modality": "t2a",
+    # Stage 1 — added by AudioDecoder + AudioToX:
+    "audio_tensor":    Tensor(80000),
+    # Stage 2 — added by OmniAudioSeqBuilder:
+    "sequence_plan":            [SE_text, SE_noisy_audio],
+    # Stage 3 — added by OmniAddTokenizedSequenceElement:
+    "tokenized_sequence_plan":  [TSE_text, TSE_noisy_audio],
+    # Stages 5–8 — TSEs inside tokenized_sequence_plan get mutated
+    # (masks / ids / positions filled in)
+    # ...
+}
+```
+
+So `sample` is **the entire state of one training row** at any point in
+the pipeline. Processors are conceptually pure functions of
+`sample → sample`, conventionally written as in-place mutations.
+
+One thing that *isn't* on `sample` until later: the structural triplet
+`(sample_lens, split_lens, attn_modes)` and the concatenated per-token
+tensors. Those are produced by `pack_sequence` (Stage 10) when N samples
+(each with its own `sample` dict) are flattened into one packed dict.
+
+A sharper version: **before `pack_sequence`, `sample` carries everything
+for one row; after `pack_sequence`, the packed dict carries everything
+for the batch.** Once flattened, the per-sample dicts are no longer used
+directly.
+
+#### Q3c. At end of Stage 3, what does each list actually contain?
+
+**Asymmetric:** the SE list carries content; the TSE list is mostly
+empty placeholder.
+
+`OmniAddTokenizedSequenceElement.forward` at
+[omni_interleaved_packed_ops_refactor.py:511-528](../../lumaverse/lib/koba/koba/processor/omni_interleaved_packed_ops_refactor.py#L511-L528):
+
+```python
+def forward(self, sample: dict):
+    sequence_plan: list[SequenceElement] = sample["sequence_plan"]
+    tokenized_sequence_plan: list[TokenizedSequenceElement] = []
+    for og_element in sequence_plan:
+        tok_element = TokenizedSequenceElement(
+            type=og_element.type,           # only these two fields are set
+            modality=og_element.modality,
+        )
+        tokenized_sequence_plan.append(tok_element)
+    sample["tokenized_sequence_plan"] = tokenized_sequence_plan
+    return sample
+```
+
+Only `type` and `modality` are copied. Every other field on
+`TokenizedSequenceElement` stays at its dataclass default — `None`.
+
+So at the end of Stage 3 the two lists are markedly asymmetric:
+
+| Field                           | `sequence_plan[i]` (SE)               | `tokenized_sequence_plan[i]` (TSE)      |
+| ------------------------------- | ------------------------------------- | --------------------------------------- |
+| `type`                          | `SequenceType.TEXT` / `NOISY_VAE_AUDIO` | Same (copied)                          |
+| `modality`                      | `"t2a"`                               | Same (copied)                          |
+| `loss`                          | `False` / `True`                       | (no such field on TSE)                  |
+| `text_str` (for TEXT element)   | `"Generate the following transcript:\n..."` | **`None`**                       |
+| `media` (for NOISY_VAE_AUDIO)   | `Media(media_type="audio", data=Tensor)` | (no such field on TSE)              |
+| `num_tokens`                    | (no such field on SE)                  | **`None`**                              |
+| `x_vae`                         | (no such field on SE)                  | **`None`**                              |
+| All per-token masks             | (no such fields on SE)                 | **all `None`**                          |
+| `input_ids`                     | (no such field on SE)                  | **`None`**                              |
+| `attention_mode`                | (no such field on SE)                  | **`None`**                              |
+
+Sharper restatement: **at end of Stage 3, the SE list carries the
+*content* (raw text strings, source media tensors), and the TSE list
+carries only *structural identity* (type, modality) — everything else
+on TSE is `None`, waiting to be filled in by later stages.**
+
+The fill-in then happens stage by stage:
+
+| Stage | Processor                | TSE fields populated                                                       |
+| :---: | ------------------------ | -------------------------------------------------------------------------- |
+| 5     | `OmniElementVAEAudio`    | `x_vae`, `text_str`, `num_tokens`, all per-token masks, `attention_mode`   |
+| 6     | `OmniElementText`        | `text_str`, `attention_mode`                                                |
+| 7     | `OmniQwen3Tokenizer`     | `input_ids`, `padding_mask`, finalizes `num_tokens` for text elements       |
+| 8     | `OmniPositionID*`        | `position_ids`                                                              |
+
+By Stage 9, the TSE list is fully populated; the SE list has been read
+but is no longer the source of truth — the trainer at Stage 11 only
+consumes TSE-derived per-token tensors.
