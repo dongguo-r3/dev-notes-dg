@@ -1,5 +1,14 @@
 # Omni T2A Dataloader — deep-dive notes
 
+> **Code-version anchor.** All line-number references in this document
+> are pinned to lumaverse commit
+> [`7fa0eb17a3c03f5386c0975f55ef7b6454405fd4`](https://github.com/lumalabs/lumaverse/tree/7fa0eb17a3c03f5386c0975f55ef7b6454405fd4)
+> (branch `dongguo/omni-t2a-v2`, committed 2026-04-28).
+> Line numbers may drift on later commits; if a referenced line doesn't
+> match the file you're looking at, check out this commit to verify, or
+> use the file path + symbol name (without line number) and re-locate
+> with `grep`.
+
 Working notes from a code-reading / debugging session on the T2A (text-to-audio)
 training data loader. Covers: the bridge → koba-v2 migration, how koba v2 shards
 a Lance table, what `shuffle_ranges` controls, a worked example of
